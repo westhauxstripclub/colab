@@ -3,7 +3,8 @@ __pycache__/
 *.tmp
 .pytest_cache/
 data/
-results/e1_mechanisms/
-results/e2_fixes/
-results/e3_lm/
+# raw per-run JSON (large); summaries, CSVs and figures are committed
+results/*/
+!results/figures/
+!results/e7_real_checkpoints/
 results/*_log.txt
