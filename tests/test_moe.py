@@ -212,3 +212,15 @@ def test_paired_statistics():
     assert all(a >= p for a, p in zip(adj, [0.01, 0.04, 0.03])) and adj[0] == pytest.approx(0.03)
     res = compare({s: 2.0 + s for s in range(10)}, {s: 1.0 + s for s in range(12)})
     assert res["n"] == 10 and res["diff"] == pytest.approx(1.0)
+
+
+def test_real_checkpoint_selection_is_distinct_sorted_and_spans_training():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
+    from e7_real_checkpoints import pick_checkpoints, saturation
+
+    names = ["main"] + [f"step{s}-tokens{s // 250}B" for s in range(0, 1_300_000, 5000)]
+    chosen = pick_checkpoints(names, 6)
+    steps = [int(c.split("-")[0][4:]) for c in chosen]
+    assert len(set(chosen)) == 6 and steps == sorted(steps) and steps[0] == 0 and steps[-1] == 1_295_000
+    top = torch.tensor([[0, 1], [2, 3]])
+    assert saturation(top, top, 2) == 1.0 and saturation(top, torch.tensor([[1, 5], [6, 7]]), 2) == 0.25
