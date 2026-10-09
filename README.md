@@ -41,9 +41,14 @@ The repo has five parts:
 7. **The most robust recipe here is to balance hard while the race is decided, then release.** With a strong aux
    loss for the first 300 steps then turned off, val loss is within 0–26% of the best method in every regime.
    No other method stays within 30% everywhere.
-8. **Tiny language model:** see [E3](#e3--does-it-hold-in-a-real-tiny-language-model).
-
-<!-- E3-TLDR -->
+8. **A tiny byte-level language model shows the same early collapse, plus a pathway only deep models have.**
+   - Without balancing, 4.4 of 8 experts are effectively used and 2 are dead per layer by the end. Most of that
+     collapse is already there by step 250.
+   - Even with the router's weights *frozen*, the layers below learn to steer tokens onto a few experts.
+   - The standard balancing settings work there: aux α=0.01 or bias balancing. They close 71% of the gap between
+     a dense model with the MoE's active parameters and one with its total parameters, versus 34% without balancing.
+   - Unbalanced learned routing is no better than a fixed byte hash.
+   - Experts split up the byte vocabulary rather than the domains.
 
 ---
 
@@ -264,7 +269,65 @@ hash routing 0.321 / 0.462; oracle 0.092 / 0.106.
 
 ### E3 – does it hold in a real (tiny) language model?
 
-<!-- E3-RESULTS -->
+**Setup.**
+- Byte-level decoder: 2 layers, width 128, 4 heads, context 128.
+- Each FFN is 8 experts of width 128 with top-2 routing: ≈350k active / 746k total parameters.
+- Training: 2500 steps at batch 32, on an even mix of Shakespeare, Python standard-library source and CPython
+  reference docs.
+- 2 seeds per method, so treat differences below ~0.03 nats/byte as noise.
+
+![LM results](results/figures/e3_val_loss.png)
+
+| method | val loss (nats/byte) | effective experts (of 8) | dead / layer | useful experts (ablation) | domain info | byte-explained |
+|---|---|---|---|---|---|---|
+| dense, same active params (width 256) | 1.659 ± 0.004 | – | – | – | – | – |
+| dense, same total params (width 1024) | 1.519 ± 0.015 | – | – | – | – | – |
+| no balancing | 1.611 ± 0.023 | 4.41 | 2.0 | 4.3 | 0.04 | 0.77 |
+| aux α=0.01, batch-level | 1.560 ± 0.016 | 7.88 | 0 | 7.2 | 0.07 | 0.77 |
+| aux α=0.01, sequence-level | 1.559 ± 0.016 | 7.87 | 0 | 7.2 | 0.03 | 0.80 |
+| aux α=0.01 + z-loss | 1.576 ± 0.015 | 7.93 | 0 | 7.3 | 0.05 | 0.80 |
+| aux-free bias | 1.559 ± 0.025 | 7.98 | 0 | 7.3 | 0.09 | 0.71 |
+| fixed hash of the byte | 1.608 ± 0.018 | 7.34 | 0 | 7.7 | 0.01 | 1.00 |
+| router frozen at init | 1.735 ± 0.011 | 5.55 | 1.5 | 4.3 | 0.07 | 0.27 |
+
+Columns 3–7 are averaged over the two MoE layers.
+- *domain info* = MI(top-1 expert; domain) / H(domain).
+- *byte-explained* = MI(top-1 expert; current byte) / H(expert).
+
+Full table: [`results/summary_e3.md`](results/summary_e3.md).
+
+1. **The same failure appears, with the same early timing.**
+   - Without balancing, effective experts drop from 7.5–7.8 at init to 3.5–4.2 by step 250 (the first checkpoint),
+     with 2.5–4 dead experts per layer.
+   - It then partly recovers, to ~4.4 effective with 2 dead. Unlike the synthetic task, the router's inputs keep
+     changing as the network learns, so a starved expert is occasionally picked up again.
+2. **Freezing the router does not prevent collapse in a deep model.**
+   - With router weights fixed at their random init, layer 1 still falls to 4.8 effective experts with 2.5 dead.
+   - Its router-logit spread grows 4× (0.22 → 0.96) although the router never changes. The layers below learned to
+     move token representations towards the experts that were helping.
+   - This is the representation-collapse pathway (Chi et al., 2022) that a single-layer synthetic task cannot show.
+   - It is also the worst model here, worse than the dense model with the same active parameters.
+3. **Here the textbook aux loss (α=0.01) is enough.**
+   - Load is balanced (7.9 effective, 0 dead) and val loss is 1.560 vs 1.611. Measured on the gap between the dense
+     model with the MoE's active parameters and the one with its total parameters, that takes the MoE from 34% to
+     71% of the way.
+   - The same α was far too weak in the synthetic task. α competes with the task-loss gradient, whose scale differs
+     between setups, so it has to be tuned per setup rather than copied.
+4. **Batch-level aux, sequence-level aux and aux-free bias tie on loss** (1.559–1.560). z-loss on top is slightly
+   worse (1.576), the third setting where it doesn't help balance.
+5. **Unbalanced learned routing is no better than a fixed hash of the byte** (1.611 vs 1.608). Learned routing
+   only paid off once it was balanced.
+6. **Experts specialise by byte, not by domain.**
+   - In any layer, routing reveals at most 13% of the information about which domain a sequence came from.
+   - For every learned router, the current byte explains 53–91% of routing entropy (≈0.9 in layer 0, 0.5–0.7 in
+     layer 1).
+   - At this scale no "code expert" emerges: experts carve up the byte vocabulary and local context. This matches
+     what the Mixtral report saw at scale.
+   - Batch-level balancing leaves about twice the domain information in layer 1 that sequence-level balancing does
+     (0.11 vs 0.05), which is the direction Qiu et al. (2025) report. With 2 seeds and no loss difference, treat it as
+     suggestive only.
+
+![Domain routing](results/figures/e3_domain_routing.png)
 
 ## 4. What I'd actually do
 
@@ -276,9 +339,10 @@ hash routing 0.321 / 0.462; oracle 0.092 / 0.106.
 
    Compare every MoE against dense baselines at matched *active* and *total* parameters.
 2. **Balance the learning signal, not the load.** The thing worth guaranteeing is that every expert gets enough
-   tokens *early* to become competent. Here that means a strong balance term (aux α≈0.1 relative to an O(1) task
-   loss, or bias balancing) during warm-up, then annealing it.
-   - For production, `α` has to be calibrated against the task-loss gradient, not copied.
+   tokens *early* to become competent. That means a balance term strong enough to win the first few hundred steps
+   (aux loss or bias balancing), then annealing it.
+   - α=0.01 was enough in the LM but far too weak in the synthetic task. Check effective experts at step ~100
+     rather than trusting a default.
    - Permanent strict balance trades quality for even load whenever the data isn't uniformly structured.
 3. **Know which constraint you are paying for.** In production, balance is also a *systems* requirement: expert
    parallelism, capacity limits and token dropping all assume roughly even load. That is a real reason to keep
@@ -289,7 +353,12 @@ hash routing 0.321 / 0.462; oracle 0.092 / 0.106.
    - Treating z-loss as a balancer.
    - Treating Sinkhorn or expert-choice balance as evidence the router itself is healthy.
    - Expert choice in autoregressive models (it uses future tokens).
-5. **If you have more experts than distinct skills, dead experts aren't the disease.** Fewer, larger experts (or a
+5. **Don't count on fixing the router.** In a deep model the representations do the collapsing too (E3), so the
+   balance pressure has to stay in the objective or in the selection rule.
+6. **Judge specialisation against token identity, not just domains.** At small scale, routing was mostly a function
+   of the current byte. A "domain expert" analysis would have found nothing and missed what the experts actually
+   split.
+7. **If you have more experts than distinct skills, dead experts aren't the disease.** Fewer, larger experts (or a
    shared expert for common features) can beat forcing redundant experts to split each skill.
 
 ## 5. Limits of this evidence (what would change these conclusions)
@@ -297,7 +366,8 @@ hash routing 0.321 / 0.462; oracle 0.092 / 0.106.
 - **The synthetic task is a single MoE layer on fixed inputs**, with linearly separable tasks and MSE loss.
   - Deep models add a pathway these runs can't show: upstream layers can *move token representations* towards a
     favoured expert (the representation collapse described by Chi et al., 2022).
-  - E3 probes this only at toy scale (2 layers, 8 experts, byte-level, 2500 steps, 2 seeds).
+  - E3 probes this only at toy scale (2 layers, 8 experts, byte-level, 2500 steps, 2 seeds), and it didn't test
+    balance-then-release. That and more seeds are the obvious next LM runs; on a GPU they take minutes.
 - **Hyperparameters were not tuned per method:**
   - aux α was swept over {1e-3, 1e-2, 1e-1, 1};
   - the bias rate (1e-2), noise std (1.0) and release step (300) were set once, the last from E1's death timing.

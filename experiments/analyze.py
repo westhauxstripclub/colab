@@ -384,7 +384,8 @@ def _plot_fixes(regime, rows, dense_rows):
                 if w in (8, 64, 256):
                     v = np.mean([r["final"]["val_loss"] for r in runs])
                     ax.axvline(v, color=SERIES[1], lw=1, ls="--")
-                    ax.text(v, y[-1] - 0.9, f"dense\nwidth {w}", color=INK2, fontsize=6.5, va="top", ha="center")
+                    ax.annotate(f"dense\nwidth {w}", (v, y[-1] - 0.9 - 0.7 * (w == 256)), xytext=(3, 0),
+                                textcoords="offset points", color=INK2, fontsize=6.5, va="top", ha="left")
             ax.set_xscale("log")
             ax.xaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter("%.2g"))
             ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
@@ -415,8 +416,9 @@ def analyze_e3():
     lines = ["# E3 – Tiny byte-level MoE language model (3 domains)\n",
              "Val loss in nats/byte, mean ± s.e. over seeds. Per-layer routing stats are averaged over the 2 MoE layers.",
              "*domain info* = MI(top-1 expert; domain)/H(domain). *byte-explained* = MI(top-1 expert; current byte)/H(expert).\n",
-             "| method | val loss | " + " | ".join(doms) + " | effective experts (of 8) | dead | domain info | byte-explained | expert CKA |",
-             "|" + "---|" * (6 + len(doms))]
+             "*useful experts* = exp(entropy) of each expert's share of the loss increase when it is ablated (per layer).\n",
+             "| method | val loss | " + " | ".join(doms) + " | effective experts (of 8) | dead | useful experts | domain info | byte-explained | expert CKA |",
+             "|" + "---|" * (8 + len(doms))]
     for m in E3_ORDER:
         runs = g.get(m, [])
         if not runs:
@@ -425,10 +427,15 @@ def analyze_e3():
         per_dom = [fmt(*mean_se([r["final"]["val_loss_by_domain"][d] for r in runs])) for d in doms]
         L = lambda k: mean_se([np.mean([l.get(k, np.nan) for l in r["final"]["layers"]]) for r in runs])  # noqa: E731
         if runs[0]["moe_config"]["n_experts"] == 1:
-            rest = "– | – | – | – | –"
+            rest = "– | – | – | – | – | –"
         else:
-            rest = (f"{fmt(*L('effective_experts'), 2)} | {fmt(*L('dead_experts'), 1)} | {fmt(*L('domain_info_recovered'), 2)} | "
-                    f"{fmt(*L('routing_explained_by_byte'), 2)} | {fmt(*L('alive_expert_cka_mean'), 2)}")
+            from moe_lab.metrics import entropy_bits
+
+            useful = mean_se([np.mean([2 ** entropy_bits(np.clip(a["ablation_delta"], 0, None)) for a in r["ablation"]])
+                              for r in runs])
+            rest = (f"{fmt(*L('effective_experts'), 2)} | {fmt(*L('dead_experts'), 1)} | {fmt(*useful, 2)} | "
+                    f"{fmt(*L('domain_info_recovered'), 2)} | {fmt(*L('routing_explained_by_byte'), 2)} | "
+                    f"{fmt(*L('alive_expert_cka_mean'), 2)}")
         lines.append(f"| {m} | {fmt(*vl)} | " + " | ".join(per_dom) + f" | {rest} |")
     (OUT / "summary_e3.md").write_text("\n".join(lines) + "\n")
 
@@ -457,16 +464,34 @@ def analyze_e3():
     fig.savefig(FIG / "e3_domain_routing.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7, 3.6))
-    for j, m in enumerate([m for m in E3_ORDER if m in g]):
-        r = sorted(g[m], key=lambda r: r["config"]["seed"])[0]
-        steps = [h["step"] for h in r["history"]]
-        ax.plot(steps, [h["val_loss"] for h in r["history"]], color=SERIES[j % 8] if j < 8 else INK2, lw=1.6, label=m)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.9), gridspec_kw=dict(width_ratios=[1, 1.15]))
+    ax = axes[0]
+    moe = [m for m in E3_ORDER if m in g and not m.startswith("dense")]
+    y = np.arange(len(moe))[::-1]
+    ms = [mean_se([r["final"]["val_loss"] for r in g[m]]) for m in moe]
+    ax.errorbar([m for m, _ in ms], y, xerr=[s for _, s in ms], fmt="o", ms=5, color=SERIES[0], ecolor=INK2,
+                elinewidth=1, capsize=2)
+    ax.set_yticks(y, moe)
+    ax.grid(axis="y", visible=False)
+    for name, lab in (("dense_active", "dense, same\nactive params"), ("dense_total", "dense, same\ntotal params")):
+        if name in g:
+            v = np.mean([r["final"]["val_loss"] for r in g[name]])
+            ax.axvline(v, color=SERIES[1], lw=1, ls="--")
+            ax.annotate(lab, (v, y[-1] - 0.9), xytext=(4, 0), textcoords="offset points", color=INK2, fontsize=7,
+                        va="top", ha="left")
+    ax.set_ylim(y[-1] - 2.0, y[0] + 0.6)
+    ax.set_xlabel("final val loss (nats/byte), mean ± s.e. over seeds")
+    ax.set_title("Balanced learned routing beats hash routing and no balancing", loc="left")
+    ax = axes[1]
+    for j, m in enumerate([m for m in ["none", "aux_1e-2_batch", "frozen_router", "hash_token"] if m in g]):
+        steps = [h["step"] for h in g[m][0]["history"]]
+        eff = np.mean([[h["layers"][-1]["effective_experts"] for h in r["history"]] for r in g[m]], axis=0)
+        ax.plot(steps, eff, color=SERIES[j], lw=2, label=m)
+    ax.set_ylim(0, 8.3)
     ax.set_xlabel("training step")
-    ax.set_ylabel("val loss (nats/byte)")
-    ax.set_ylim(top=2.6)
-    ax.legend(fontsize=7, ncol=2)
-    ax.set_title("Validation loss (seed 0)", loc="left")
+    ax.set_ylabel("effective experts, last MoE layer (of 8)")
+    ax.set_title("Collapse happens early, even with the router frozen", loc="left")
+    ax.legend(fontsize=7, loc="lower left")
     fig.tight_layout()
     fig.savefig(FIG / "e3_val_loss.png", dpi=160)
     plt.close(fig)
