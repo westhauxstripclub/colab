@@ -109,3 +109,18 @@ def test_metrics_basics():
     labels = np.repeat(np.arange(4), 25)
     assert specialization(labels, labels)["label_info_recovered"] == pytest.approx(1.0)
     assert specialization(np.zeros(100, int), labels)["label_info_recovered"] == pytest.approx(0.0)
+
+
+def test_aux_loss_pull_on_a_dead_expert_vanishes_with_its_probability():
+    """d L_aux / d logit_i = E * P_i * (f_i - sum_j f_j P_j): for a dead expert (f_i = 0) the restoring push is
+    proportional to P_i, so once the router is confident (P_i ~ 0) the aux loss can no longer revive it."""
+    layer = make(top_k=1, aux_loss_coef=1.0)
+    pulls = []
+    for dead_logit in (0.0, -3.0, -6.0):
+        logits = torch.tensor([[2.0, 1.0, 0.5, dead_logit]] * 16, requires_grad=True)
+        M = torch.zeros(16, 4, dtype=torch.bool)
+        M[:8, 0] = M[8:12, 1] = M[12:, 2] = True  # expert 3 receives no tokens
+        layer._switch_aux(M, logits.softmax(-1), None).backward()
+        pulls.append(-logits.grad[:, 3].sum().item())
+    assert all(p > 0 for p in pulls)  # gradient descent raises the dead expert's logit...
+    assert pulls[0] > 10 * pulls[2]  # ...but the push shrinks with its probability
