@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import math
+import os
 from collections import defaultdict
+from pathlib import Path
 
 import matplotlib
 
@@ -11,7 +13,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from common import RESULTS, load_results  # noqa: E402
 
-FIG = RESULTS / "figures"
+OUT = Path(os.environ.get("MOE_LAB_OUT", RESULTS))  # where figures/tables go (raw runs are always read from results/)
+FIG = OUT / "figures"
 # Reference categorical palette (fixed order, never cycled) + recessive ink.
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
@@ -139,8 +142,14 @@ def analyze_e1():
         ax.set_xlabel("fraction of experts dead at end of training")
         ax.set_title(f"{regime}: {E} experts, {E} latent tasks", loc="left")
         ax.grid(axis="y", visible=False)
-        for yi, m in zip(y, means):
-            ax.text(m + 0.01, yi, f"{m:.2f}", va="center", ha="left", color=INK2, fontsize=8)
+        pad = 0.012 * max(means)
+        for yi, m, se in zip(y, means, ses):
+            ax.text(m + se + 2 * pad, yi, f"{m:.2f}", va="center", ha="left", color=INK2, fontsize=8)
+        init = np.mean([r["history"][0]["dead_experts"] for r in g[f"{regime}__baseline"]]) / E
+        if init > 0:
+            ax.axvline(init, color=INK2, lw=1, ls="--")
+            ax.text(init, y[0] + 0.55, " dead already at init", color=INK2, fontsize=7, va="bottom")
+        ax.set_xlim(0, max(m + s for m, s in zip(means, ses)) * 1.15)
     fig.suptitle("Which link of the feedback loop causes dead experts? (no load balancing in any condition)",
                  x=0.01, ha="left", fontweight="bold")
     fig.tight_layout()
@@ -167,7 +176,7 @@ def analyze_e1():
                      f"(fair share {1 / 8:.3f}).")
     _plot_dynamics(g)
     _overfitting(g, lines)
-    (RESULTS / "summary_e1.md").write_text("\n".join(lines) + "\n")
+    (OUT / "summary_e1.md").write_text("\n".join(lines) + "\n")
 
 
 def _plot_dynamics(g):
@@ -283,7 +292,8 @@ def _overfitting(g, lines):
 
 # ------------------------------------------------------------------------------------- E2
 E2_ORDER = ["none", "aux_1e-3", "aux_1e-2", "aux_1e-1", "aux_1", "zloss_1e-3", "aux_1e-2+zloss", "explore_noise_1",
-            "auxfree_bias_1e-2", "expert_choice", "sinkhorn", "cosine_router", "revive_dead", "hash_fixed", "oracle"]
+            "auxfree_bias_1e-2", "expert_choice", "sinkhorn", "cosine_router", "revive_dead", "aux_1e-1_then_release",
+            "auxfree_bias_then_freeze", "sinkhorn_then_release", "hash_fixed", "oracle"]
 
 
 def analyze_e2():
@@ -330,13 +340,13 @@ def analyze_e2():
         lines += ["", "Dense baselines: " + ", ".join(
             f"width {w}: {np.mean([r['final']['val_loss'] for r in runs]):.3f}" for w, runs in dense_rows)]
         _plot_fixes(regime, rows, dense_rows)
-    (RESULTS / "summary_e2.md").write_text("\n".join(lines) + "\n")
+    (OUT / "summary_e2.md").write_text("\n".join(lines) + "\n")
 
 
 def _plot_fixes(regime, rows, dense_rows):
-    panels = [("val", "val loss (lower is better)"), ("eff", "effective experts (exp entropy of load)"),
-              ("rec", "task info recovered by routing"), ("cka", "similarity of alive experts (CKA)")]
-    fig, axes = plt.subplots(1, 4, figsize=(15, 0.32 * len(rows) + 1.6), sharey=True)
+    panels = [("val", "val loss (log scale, lower is better)"), ("eff", "effective experts (balance of load)"),
+              ("rec", "task info recovered by routing"), ("useful", "useful experts (loss rises if ablated)")]
+    fig, axes = plt.subplots(1, 4, figsize=(15, 0.32 * len(rows) + 2.0), sharey=True)
     y = np.arange(len(rows))[::-1]
     for ax, (key, title) in zip(axes, panels):
         m = [r[key][0] for r in rows]
@@ -349,8 +359,16 @@ def _plot_fixes(regime, rows, dense_rows):
                 if w in (8, 64, 256):
                     v = np.mean([r["final"]["val_loss"] for r in runs])
                     ax.axvline(v, color=SERIES[1], lw=1, ls="--")
-                    ax.text(v, y[0] + 0.7, f"dense {w}", color=INK2, fontsize=7, rotation=90, va="bottom", ha="right")
+                    ax.text(v, y[-1] - 0.9, f"dense\nwidth {w}", color=INK2, fontsize=6.5, va="top", ha="center")
             ax.set_xscale("log")
+            ax.xaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter("%.2g"))
+            ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+            lo = min(m) * 0.85
+            ax.set_xticks([t for t in (0.1, 0.15, 0.2, 0.3, 0.5, 0.8) if t >= lo])
+            ax.set_ylim(y[-1] - 2.2, y[0] + 0.7)
+        if key in ("eff", "useful"):
+            E = max(r["eff"][0] for r in rows)
+            ax.axvline(round(E), color=INK2, lw=1, ls=":")
     axes[0].set_yticks(y, [r["method"] for r in rows])
     fig.suptitle(f"Regime {regime}: balancing methods compared (mean ± s.e. over seeds)", x=0.01, ha="left", fontweight="bold")
     fig.tight_layout()
@@ -387,7 +405,7 @@ def analyze_e3():
             rest = (f"{fmt(*L('effective_experts'), 2)} | {fmt(*L('dead_experts'), 1)} | {fmt(*L('domain_info_recovered'), 2)} | "
                     f"{fmt(*L('routing_explained_by_byte'), 2)} | {fmt(*L('alive_expert_cka_mean'), 2)}")
         lines.append(f"| {m} | {fmt(*vl)} | " + " | ".join(per_dom) + f" | {rest} |")
-    (RESULTS / "summary_e3.md").write_text("\n".join(lines) + "\n")
+    (OUT / "summary_e3.md").write_text("\n".join(lines) + "\n")
 
     show = [m for m in ["none", "aux_1e-2_batch", "aux_1e-2_sequence", "auxfree_bias_1e-2"] if m in g]
     if not show:
@@ -453,7 +471,7 @@ def export_csv():
                 row["experts_per_task"] = experts_per_task(r)
             rows.append(row)
         keys = list(dict.fromkeys(k for row in rows for k in row))
-        with open(RESULTS / f"runs_{exp}.csv", "w", newline="") as fh:
+        with open(OUT / f"runs_{exp}.csv", "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=keys)
             w.writeheader()
             w.writerows(rows)
@@ -465,4 +483,4 @@ if __name__ == "__main__":
     analyze_e1()
     analyze_e2()
     analyze_e3()
-    print("wrote", sorted(p.name for p in RESULTS.glob("summary_*.md")), sorted(p.name for p in FIG.glob("*.png")))
+    print("wrote", sorted(p.name for p in OUT.glob("summary_*.md")), sorted(p.name for p in FIG.glob("*.png")))

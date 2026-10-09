@@ -132,6 +132,7 @@ class MoELayer(nn.Module):
         self.force_expert: int | None = None  # used for "head start" pre-training of one expert
         self.disabled: list[int] = []  # experts removed from routing (ablation analysis)
         self.capture_input = False
+        self.bias_frozen = False  # keep applying the bias but stop updating it
         self.last: dict = {}
         self.aux_losses: dict[str, torch.Tensor] = {}
 
@@ -271,7 +272,7 @@ class MoELayer(nn.Module):
     @torch.no_grad()
     def update_bias(self):
         """DeepSeek-V3 aux-loss-free balancing: nudge under-loaded experts up, over-loaded down."""
-        if self.cfg.bias_update_rate <= 0 or "M_sel" not in self.last:
+        if self.cfg.bias_update_rate <= 0 or self.bias_frozen or "M_sel" not in self.last:
             return
         load = self.last["M_sel"].float().sum(0)
         self.bias += self.cfg.bias_update_rate * torch.sign(load.mean() - load)

@@ -23,9 +23,15 @@ METHODS = {
     "cosine_router": dict(moe=dict(router_type="cosine")),
     "revive_dead": dict(revive_every=200),
     "hash_fixed": dict(moe=dict(router="hash")),
+    # Balance only for the first 300 steps (when the dead-expert race is decided), then release.
+    "aux_1e-1_then_release": dict(moe=dict(aux_loss_coef=1e-1), balance_until=300),
+    "auxfree_bias_then_freeze": dict(moe=dict(bias_update_rate=1e-2), balance_until=300),
+    "sinkhorn_then_release": dict(moe=dict(router="sinkhorn"), balance_until=300),
     "oracle": dict(moe=dict(router="oracle")),
 }
-ZIPF_METHODS = ["none", "aux_1e-2", "aux_1e-1", "auxfree_bias_1e-2", "expert_choice", "sinkhorn", "revive_dead", "oracle"]
+RELEASE = ["aux_1e-1_then_release", "auxfree_bias_then_freeze", "sinkhorn_then_release"]
+ZIPF_METHODS = ["none", "aux_1e-2", "aux_1e-1", "auxfree_bias_1e-2", "expert_choice", "sinkhorn", "revive_dead",
+                "oracle"] + RELEASE
 DENSE_WIDTHS = [8, 16, 32, 64, 128, 256, 512]
 
 

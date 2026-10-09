@@ -34,6 +34,8 @@ class SynthRunConfig:
     freeze_experts: bool = False  # experts fixed at init; only the router learns (pure selection)
     load_normalized_grads: bool = False  # rescale each expert's grad by mean_load / load_e
     head_start_steps: int = 0  # train expert 0 alone on everything before MoE training begins
+    # --- fix: balance only while the early race is decided, then let routing settle freely
+    balance_until: int = 0  # >0: at this step drop the aux loss, freeze the bias, switch Sinkhorn -> softmax top-k
     # --- fix: re-initialise starved experts by splitting the busiest one
     revive_every: int = 0
     revive_threshold: float = 0.1  # "dead" = EMA load below threshold / E
@@ -230,6 +232,11 @@ def run_synthetic(rc: SynthRunConfig) -> dict:
             snapshots[step] = heavy_eval(model, task)
         if step == rc.steps:
             break
+        if rc.balance_until and step == rc.balance_until:
+            layer.cfg.aux_loss_coef = 0.0
+            layer.bias_frozen = True
+            if layer.cfg.router == "sinkhorn":
+                layer.cfg.router = "softmax_topk"
         train_step()
         if rc.revive_every and cfg.router in TOKEN_CHOICE_ROUTERS:
             frac = layer.last["M"].float().sum(0)
