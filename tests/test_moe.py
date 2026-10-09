@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from moe_lab.metrics import load_stats, specialization  # noqa: E402
@@ -124,3 +125,90 @@ def test_aux_loss_pull_on_a_dead_expert_vanishes_with_its_probability():
         pulls.append(-logits.grad[:, 3].sum().item())
     assert all(p > 0 for p in pulls)  # gradient descent raises the dead expert's logit...
     assert pulls[0] > 10 * pulls[2]  # ...but the push shrinks with its probability
+
+
+# ----------------------------------------------------------------------------------- round 2 additions
+from moe_lab.data import make_cluster_task  # noqa: E402
+from moe_lab.metrics import logit_decomposition  # noqa: E402
+from moe_lab.stats import bootstrap_ci, compare, holm, sign_flip_pvalue  # noqa: E402
+from moe_lab.train_synthetic import SynthRunConfig, _rownorm_router_grads, run_synthetic  # noqa: E402
+
+
+def _router_only_layer(detach):
+    layer = make(top_k=1, router_detach_input=detach)
+    with torch.no_grad():
+        layer.experts.w1.zero_()  # expert outputs no longer depend on x: x reaches the output only via the router
+        layer.experts.b1.normal_()  # ...but are nonzero constants
+    return layer
+
+
+def test_router_detach_input_blocks_routing_gradient_into_representations():
+    for detach, expect_x_grad in ((False, True), (True, False)):
+        layer = _router_only_layer(detach)
+        x = torch.randn(32, 6, requires_grad=True)
+        layer(x).pow(2).sum().backward()
+        x_grad = x.grad is not None and x.grad.abs().sum() > 0
+        assert x_grad == expect_x_grad
+        assert layer.router.weight.grad.abs().sum() > 0  # the router itself still learns
+
+
+def test_xor_tasks_are_not_linearly_decodable():
+    t = make_cluster_task(n_clusters=8, routing="xor", seed=0)
+    bit0 = (t.c_train % 2).float()
+    w = torch.zeros(t.x_train.shape[1] + 1, requires_grad=True)
+    opt = torch.optim.Adam([w], lr=0.05)
+    X = torch.cat([t.x_train, torch.ones(len(t.x_train), 1)], 1)
+    for _ in range(300):
+        opt.zero_grad()
+        F.binary_cross_entropy_with_logits(X @ w, bit0).backward()
+        opt.step()
+    Xv = torch.cat([t.x_val, torch.ones(len(t.x_val), 1)], 1)
+    acc = ((Xv @ w > 0).float() == (t.c_val % 2).float()).float().mean().item()
+    assert acc < 0.56  # chance is 0.5; a linear probe cannot recover an XOR bit
+
+
+def test_test_split_is_separate_and_ce_labels_are_classes():
+    t = make_cluster_task(loss="ce", d_out=5, seed=1)
+    assert t.x_test.shape == t.x_val.shape and not torch.equal(t.x_test, t.x_val)
+    assert t.y_train.dtype == torch.long and int(t.y_train.max()) < 5
+
+
+def test_deep_and_ce_runs_report_per_layer_and_test_metrics():
+    r = run_synthetic(SynthRunConfig(name="t", depth=2, steps=20, eval_every=10, decomp_probe=128,
+                                     moe=dict(d_hidden=4), task=dict(loss="ce")))
+    f = r["final"]
+    assert len(f["layers"]) == 2 and 0.0 <= f["test_acc"] <= 1.0
+    assert f["dead_experts"] == pytest.approx(np.mean([l["dead_experts"] for l in f["layers"]]))
+    assert len(r["history"][-1]["decomp"]) == 2
+
+
+def test_logit_decomposition_attributes_change_to_the_right_pathway():
+    layer = make(top_k=1)
+    x0 = torch.randn(64, 6)
+    p0 = {k: v.detach().clone() for k, v in layer.router.named_parameters()}
+    moved_inputs = logit_decomposition(layer, x0, x0 + torch.randn(64, 6), p0, 1)
+    assert moved_inputs["rms_router"] == 0 and moved_inputs["rms_rep"] > 0
+    with torch.no_grad():
+        layer.router.weight.add_(torch.randn_like(layer.router.weight))
+    moved_router = logit_decomposition(layer, x0, x0, p0, 1)
+    assert moved_router["rms_rep"] == 0 and moved_router["rms_router"] == pytest.approx(moved_router["rms_total"])
+
+
+def test_router_grad_rownorm_equalises_row_norms():
+    layer = make(top_k=1)
+    layer(torch.randn(64, 6)).pow(2).sum().backward()
+    _rownorm_router_grads(layer)
+    norms = layer.router.weight.grad.norm(dim=1)
+    assert torch.allclose(norms[norms > 0], norms[norms > 0].mean().expand_as(norms[norms > 0]), rtol=1e-5)
+
+
+def test_paired_statistics():
+    rng = np.random.default_rng(0)
+    d = 1.0 + 0.1 * rng.standard_normal(20)
+    mean, lo, hi = bootstrap_ci(d)
+    assert lo < 1.0 < hi and lo < mean < hi
+    assert sign_flip_pvalue(d) < 0.001 and sign_flip_pvalue(rng.standard_normal(20) * 0.0) == 1.0
+    adj = holm([0.01, 0.04, 0.03])
+    assert all(a >= p for a, p in zip(adj, [0.01, 0.04, 0.03])) and adj[0] == pytest.approx(0.03)
+    res = compare({s: 2.0 + s for s in range(10)}, {s: 1.0 + s for s in range(12)})
+    assert res["n"] == 10 and res["diff"] == pytest.approx(1.0)

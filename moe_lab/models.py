@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +21,41 @@ class SyntheticMoE(nn.Module):
 
     def moe_layers(self):
         return [self.moe]
+
+
+class DeepSyntheticMoE(nn.Module):
+    """Residual stack of MoE layers on the synthetic task: in-proj -> L x [h + MoE(LN(h))] -> LN -> out-proj.
+
+    Unlike SyntheticMoE, every router sees *learned* representations, so the network can move tokens toward a
+    favoured expert (the representation pathway), and tasks that are not linearly separable in x can still be
+    routed by task in later layers. A dense baseline is the same model with one expert per layer.
+    """
+
+    def __init__(self, cfg: MoEConfig, d_in: int, d_out: int, n_layers: int = 2, d_model: int = 32,
+                 pre_dense: int = 0):
+        super().__init__()
+        self.inp = nn.Linear(d_in, d_model)
+        # Optional dense residual MLP before the first MoE layer: gives the first router nonlinear features, the
+        # way attention / earlier layers do in a transformer.
+        self.pre = None
+        if pre_dense:
+            self.pre = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, pre_dense), nn.GELU(),
+                                     nn.Linear(pre_dense, d_model))
+        self.norms = nn.ModuleList(nn.LayerNorm(d_model) for _ in range(n_layers))
+        self.moes = nn.ModuleList(MoELayer(replace(cfg, d_in=d_model, d_out=d_model)) for _ in range(n_layers))
+        self.ln_f = nn.LayerNorm(d_model)
+        self.out = nn.Linear(d_model, d_out)
+
+    def forward(self, x, labels=None):
+        h = self.inp(x)
+        if self.pre is not None:
+            h = h + self.pre(h)
+        for ln, moe in zip(self.norms, self.moes):
+            h = h + moe(ln(h), labels=labels)
+        return self.out(self.ln_f(h))
+
+    def moe_layers(self):
+        return list(self.moes)
 
 
 class CausalSelfAttention(nn.Module):

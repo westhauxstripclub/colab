@@ -48,6 +48,7 @@ class MoEConfig:
     bias_update_rate: float = 0.0  # >0 enables DeepSeek-V3 auxiliary-loss-free bias balancing
     identical_init: bool = False  # all experts start as exact copies
     zero_init_output: bool = False  # experts start by outputting exactly 0 (no "noise" for the router to react to)
+    router_detach_input: bool = False  # router sees x.detach(): routing gradients cannot move the representations
     compute_all: bool = True  # run every expert on every token (exact same gradients; enables diagnostics)
     hash_vocab: int = 256  # vocabulary size for token-hash routing
     sinkhorn_iters: int = 3
@@ -226,7 +227,7 @@ class MoELayer(nn.Module):
     # ------------------------------------------------------------------ forward
     def forward(self, x, *, token_ids=None, group_ids=None, labels=None):
         cfg = self.cfg
-        logits = self.router(x)
+        logits = self.router(x.detach() if cfg.router_detach_input else x)
         M, G, M_sel, probs = self._route(x, logits, token_ids, labels)
         if self.disabled and cfg.router not in TOKEN_CHOICE_ROUTERS:  # fixed routers: just drop the expert
             M, G = M.clone(), G.clone()
@@ -282,6 +283,13 @@ class MoELayer(nn.Module):
         if self.cfg.router in ("softmax_topk", "sinkhorn", "expert_choice"):
             return probs
         return torch.ones_like(probs)
+
+    @torch.no_grad()
+    def router_logits_with(self, x: torch.Tensor, params: dict | None = None) -> torch.Tensor:
+        """Router logits for inputs x under the given router parameters (default: the current ones)."""
+        if params is None:
+            return self.router(x)
+        return torch.func.functional_call(self.router, params, (x,))
 
     @torch.no_grad()
     def counterfactual_outputs(self, x: torch.Tensor) -> torch.Tensor:

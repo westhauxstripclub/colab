@@ -1,5 +1,8 @@
 """E1 - WHY do experts collapse? Causal interventions on the router/expert feedback loop.
 
+Round 2 (results/e1v2_mechanisms): 20 paired seeds per condition and a factorial over which component is trained
+with SGD, to locate where SGD's extra collapse comes from.
+
 Each condition removes or amplifies one link of the hypothesised loop
     expert gets tokens -> expert gets gradient -> expert improves on those tokens
     -> router (which only sees feedback from the expert it picked) sends it more tokens
@@ -21,6 +24,11 @@ CONDITIONS = {
     "adam_load_normalized": dict(load_normalized_grads=True),
     "sgd": dict(optimizer="sgd", lr=0.05),  # update size proportional to #tokens
     "sgd_load_normalized": dict(optimizer="sgd", lr=0.05, load_normalized_grads=True),
+    # 2x2 factorial over which part uses SGD, plus probes of the router pathway (round 2)
+    "sgd_router_only": dict(router_optimizer="sgd"),  # router SGD (lr 0.05), experts Adam
+    "sgd_experts_only": dict(optimizer="sgd", lr=0.05, router_optimizer="adam"),  # experts SGD, router Adam
+    "sgd_router_rownorm": dict(optimizer="sgd", lr=0.05, router_grad_rownorm=True),
+    "sgd_rownorm_loadnorm": dict(optimizer="sgd", lr=0.05, router_grad_rownorm=True, load_normalized_grads=True),
     "head_start_200": dict(head_start_steps=200),  # give expert 0 a lead
     "router_warmup_100": dict(router_warmup_steps=100),  # let experts learn before the router reacts
     "zero_init_output": dict(moe=dict(zero_init_output=True)),  # no random expert outputs at init
@@ -49,7 +57,8 @@ def configs(seeds):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seeds", type=int, default=8)
+    ap.add_argument("--seeds", type=int, default=20)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--exp", default="e1v2_mechanisms", help="results subdirectory (round 1 used e1_mechanisms, 8 seeds)")
     a = ap.parse_args()
-    run_grid("synthetic", "e1_mechanisms", configs(range(a.seeds)), workers=a.workers)
+    run_grid("synthetic", a.exp, configs(range(a.seeds)), workers=a.workers)

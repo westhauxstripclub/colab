@@ -10,7 +10,8 @@ import torch
 import torch.nn.functional as F
 
 from .data import load_text_corpus, sample_text_batch
-from .metrics import expert_redundancy, gini, load_stats, mutual_info_bits, router_stats, specialization
+from .metrics import (expert_redundancy, gini, load_stats, logit_decomposition, mutual_info_bits, router_stats,
+                      specialization)
 from .models import TinyMoETransformer
 from .moe import MoEConfig
 
@@ -34,6 +35,11 @@ class LMRunConfig:
     eval_every: int = 250
     eval_batches: int = 6
     freeze_router: bool = False
+    balance_until: int = 0  # >0: at this step drop the aux loss and freeze the aux-free bias (balance-then-release)
+    early_eval_every: int = 0  # >0: extra cheap evals at this interval up to early_eval_until (collapse is early)
+    early_eval_until: int = 500
+    early_eval_batches: int = 2
+    decomp_probe_seqs: int = 8  # fixed probe sequences for the representation-vs-router logit decomposition
     data_dir: str = "data"
     device: str = "cpu"
 
@@ -46,7 +52,7 @@ def _lr_at(step, rc):
 
 
 @torch.no_grad()
-def evaluate(model, corpus, rc, full=False):
+def evaluate(model, corpus, rc, full=False, n_batches=None):
     model.eval()
     layers = model.moe_layers()
     gen = torch.Generator().manual_seed(999)  # identical eval batches for every run
@@ -56,7 +62,7 @@ def evaluate(model, corpus, rc, full=False):
     doms, bytes_ = [], []
     for li, layer in enumerate(layers):
         layer.capture_input = full and li >= 0
-    for _ in range(rc.eval_batches):
+    for _ in range(n_batches or rc.eval_batches):
         x, y, d = sample_text_batch(corpus, "val", rc.batch_size, rc.seq_len, gen)
         x, y = x.to(rc.device), y.to(rc.device)
         logits = model(x)
@@ -124,6 +130,21 @@ def ablation(model, corpus, rc):
     return res
 
 
+@torch.no_grad()
+def capture_router_inputs(model, x):
+    model.eval()
+    layers = model.moe_layers()
+    for l in layers:
+        l.capture_input = True
+    model(x)
+    xs = [l.last["x"].clone() for l in layers]
+    for l in layers:
+        l.capture_input = False
+        l.last.pop("x", None)
+    model.train()
+    return xs
+
+
 def run_lm(rc: LMRunConfig) -> dict:
     t0 = time.time()
     torch.manual_seed(rc.seed)
@@ -136,14 +157,30 @@ def run_lm(rc: LMRunConfig) -> dict:
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=rc.lr, betas=(0.9, 0.95), weight_decay=rc.weight_decay)
     gen = torch.Generator().manual_seed(rc.seed)
+    layers = model.moe_layers()
+    probe, _, _ = sample_text_batch(corpus, "val", rc.decomp_probe_seqs, rc.seq_len, torch.Generator().manual_seed(1234))
+    probe = probe.to(rc.device)
+    x0s = capture_router_inputs(model, probe)
+    params0 = [{k: v.detach().clone() for k, v in l.router.named_parameters()} for l in layers]
     history = []
     for step in range(rc.steps + 1):
-        if step % rc.eval_every == 0 or step == rc.steps:
-            ev = evaluate(model, corpus, rc, full=(step == rc.steps))
+        full_eval = step % rc.eval_every == 0 or step == rc.steps
+        early_eval = rc.early_eval_every and step <= rc.early_eval_until and step % rc.early_eval_every == 0
+        if full_eval or early_eval:
+            ev = evaluate(model, corpus, rc, full=(step == rc.steps), n_batches=None if full_eval else rc.early_eval_batches)
             ev["step"] = step
+            ev["light"] = not full_eval
+            if cfg.n_experts > 1:
+                xts = capture_router_inputs(model, probe)
+                ev["decomp"] = [logit_decomposition(l, x0, xt, p0, l.cfg.top_k)
+                                for l, x0, xt, p0 in zip(layers, x0s, xts, params0)]
             history.append(ev)
         if step == rc.steps:
             break
+        if rc.balance_until and step == rc.balance_until:
+            for l in layers:
+                l.cfg.aux_loss_coef = 0.0
+                l.bias_frozen = True
         for g in opt.param_groups:
             g["lr"] = _lr_at(step, rc)
         x, y, _ = sample_text_batch(corpus, "train", rc.batch_size, rc.seq_len, gen)
