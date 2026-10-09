@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.tmp
+.pytest_cache/
+data/
+results/e1_mechanisms/
+results/e2_fixes/
+results/e3_lm/
+results/*_log.txt
