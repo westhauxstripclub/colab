@@ -340,7 +340,32 @@ def analyze_e2():
         lines += ["", "Dense baselines: " + ", ".join(
             f"width {w}: {np.mean([r['final']['val_loss'] for r in runs]):.3f}" for w, runs in dense_rows)]
         _plot_fixes(regime, rows, dense_rows)
+    lines += _robustness(g)
     (OUT / "summary_e2.md").write_text("\n".join(lines) + "\n")
+
+
+def _robustness(g):
+    """No method wins every regime, so rank by how far each is from the best non-oracle method per regime."""
+    regimes = ["E8", "E32", "E16C8", "E8zipf"]
+    best = {}
+    for reg in regimes:
+        vals = [np.mean([r["final"]["val_loss"] for r in runs]) for n, runs in g.items()
+                if n.startswith(f"{reg}__") and "dense" not in n and not n.endswith("oracle")]
+        best[reg] = min(vals) if vals else float("nan")
+    rows = []
+    for m in E2_ORDER:
+        if m == "oracle" or not all(f"{reg}__{m}" in g for reg in regimes):
+            continue
+        ratios = [np.mean([r["final"]["val_loss"] for r in g[f"{reg}__{m}"]]) / best[reg] for reg in regimes]
+        rows.append((float(np.exp(np.mean(np.log(ratios)))), max(ratios), m, ratios))
+    if not rows:
+        return []
+    out = ["\n## Robustness across regimes\n",
+           "Val loss divided by the best non-oracle method in each regime (1.00 = best there). Sorted by geometric mean.\n",
+           "| method | " + " | ".join(regimes) + " | geo-mean | worst |", "|" + "---|" * (len(regimes) + 3)]
+    for gm, worst, m, ratios in sorted(rows):
+        out.append(f"| {m} | " + " | ".join(f"{x:.2f}" for x in ratios) + f" | {gm:.2f} | {worst:.2f} |")
+    return out
 
 
 def _plot_fixes(regime, rows, dense_rows):
