@@ -224,3 +224,9 @@ def test_real_checkpoint_selection_is_distinct_sorted_and_spans_training():
     assert len(set(chosen)) == 6 and steps == sorted(steps) and steps[0] == 0 and steps[-1] == 1_295_000
     top = torch.tensor([[0, 1], [2, 3]])
     assert saturation(top, top, 2) == 1.0 and saturation(top, torch.tensor([[1, 5], [6, 7]]), 2) == 0.25
+
+
+def test_single_expert_dense_baseline_runs_with_all_diagnostics():
+    r = run_synthetic(SynthRunConfig(name="t", steps=5, eval_every=5, snapshot_steps=(0,),
+                                     moe=dict(n_experts=1, top_k=1, router="topk_renorm", d_hidden=4)))
+    assert math.isnan(r["final"]["substitution_gap"])
