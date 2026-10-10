@@ -243,7 +243,11 @@ def analyze_e4():
             cells.append(s)
         L.append(f"| {m} | " + " | ".join(cells) + " |")
 
-    # Robustness ranking + gap closed.
+    # Robustness ranking + gap closed (needs every method in every regime).
+    if not all(g.get(f"{reg}__{m}__global") for reg in TUNE_REGIMES for m in METHODS) or \
+            not all(g.get(f"{reg}__dense_8__-") and g.get(f"{reg}__oracle__-") for reg in TUNE_REGIMES):
+        (OUT / "summary_e4.md").write_text("\n".join(L) + "\n\n(evaluation incomplete)\n")
+        return
     best = {reg: min(np.mean(test(f"{reg}__{m}__global")) for m in METHODS if g.get(f"{reg}__{m}__global"))
             for reg in TUNE_REGIMES}
     dense_active = {reg: np.mean(test(f"{reg}__dense_8__-")) for reg in TUNE_REGIMES}
