@@ -122,6 +122,8 @@ def routed_cka(outputs: torch.Tensor, top1: torch.Tensor, alive: np.ndarray, min
 def substitution_gap(cf_loss: torch.Tensor, top1: torch.Tensor, alive: np.ndarray, min_tokens: int = 20) -> float:
     """How much worse the best *other* expert is on an expert's own tokens, relative to that expert (mean over alive
     experts). Near 0 = the expert is replaceable (redundant); large = it does something nobody else can."""
+    if cf_loss.shape[1] < 2:
+        return float("nan")
     gaps = []
     for e in range(cf_loss.shape[1]):
         sel = top1 == e
