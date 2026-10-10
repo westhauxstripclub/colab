@@ -5,50 +5,69 @@ few experts, and what turns an MoE into an actual mixture rather than a dense mo
 
 The repo has five parts:
 - A from-scratch MoE layer in which every routing and balancing strategy is a swappable option.
-- Two datasets with *known* ground-truth structure, so "specialisation" can be measured rather than eyeballed.
-- A set of diagnostics.
-- Three experiment suites.
-- The results of running all of them: ~800 synthetic runs and 18 small language-model runs, all on 4 CPU cores.
+- Datasets with *known* ground-truth structure, so "specialisation" can be measured rather than eyeballed.
+- A set of diagnostics, including a check of which of them actually detect what they claim to.
+- Seven experiment suites, including a held-out test that was pre-registered before it ran.
+- The results of running them on 4 CPU cores: ~5,000 synthetic runs and 55 small language-model runs.
+
+The work ran in two rounds:
+- **Round 1** (E1–E3) found the mechanism and proposed a fix.
+- **Round 2** (E1 v2, E3 v2, E4–E7) attacked round 1's own stated limitations:
+  - more seeds, with paired statistics;
+  - per-method tuning;
+  - a pre-registered held-out test;
+  - deep models and non-linearly-separable tasks;
+  - a larger language model;
+  - a script for real pretraining checkpoints.
+
+Where round 2 contradicted round 1, this README says so.
 
 ## TL;DR
 
-1. **It isn't overfitting.** Busy experts fit their own tokens *worse* (they are capacity-starved) and generalise
-   *better*. Idle experts aren't underfit so much as *never trained*. The few experts that do overfit are the lightly
-   used ones.
-2. **Collapse is a race that is decided in the first ~100 optimizer steps** (median death step: 10). It is not
-   slow drift over a long run.
-3. **The cause is a greedy router that only receives feedback about the expert it picked.**
-   - Each latent task ends up owned by exactly one expert (1.00–1.02 experts per task).
-   - Which expert wins a task is effectively random and uncoordinated across tasks.
-   - Losers get no gradient ever again, so they can never come back.
+1. **It isn't overfitting.** Busy experts fit their own tokens *worse*: they are capacity-starved.
+   - With scarce data, busy experts also generalise *better*, and the few experts that overfit are the lightly
+     used ones.
+   - With plentiful data, the generalisation gap is unrelated to load (20 seeds).
+   - Idle experts aren't underfit so much as *never trained*.
+2. **Collapse is mostly a race decided early.**
+   - In the synthetic tasks, median death step is 10 and 99–100% of deaths happen before step 100.
+   - In the 4-layer LM, 78% of eventually-dead experts are dead by step 100 (3% of training).
+   - Some LM experts come back later, so it is less final than in the synthetic tasks.
+3. **The core cause is a greedy router that only gets feedback about the expert it picked.**
+   - Each latent task ends up with one owning expert.
+   - Which expert wins each task is effectively random.
+   - Losers stop receiving gradient.
 
-   With 32 experts and 32 tasks, 39% of experts die. A model that gives each task a uniformly random owner
-   predicts 36% (≈1/e).
-4. **What didn't matter, and what did:**
-   - *No effect:* initial expert asymmetry (identical init), the router's learning rate (×0.1 or ×10), giving one
-     expert a head start, and a router warm-up.
-   - *Prevents it:* freezing the router.
-   - *Makes it much worse:* plain SGD (77% of experts dead vs 39% with Adam). Adam's per-parameter normalisation
-     is already a partial fix.
-5. **The standard fixes work, but only if they are strong enough.** The textbook Switch aux loss at α=0.01 barely
-   helps here. α=0.1, DeepSeek-V3-style bias balancing, or Sinkhorn routing reach near-oracle quality when the data
-   has one skill per expert. z-loss does nothing for balance: it *increased* collapse with 32 experts.
-6. **Perfect balance is the wrong target when the data isn't shaped like the experts.** Two cases:
-   - *More experts than skills:* every method that actually enforces balance does worse than no balancing at all.
-     It ends up splitting each skill across redundant experts.
-   - *Skill frequencies follow a Zipf distribution:* forcing balance does worse than no balancing by up to 73%.
-     Even the oracle routing is imbalanced there (5.5 effective experts out of 8).
-7. **The most robust recipe here is to balance hard while the race is decided, then release.** With a strong aux
-   loss for the first 300 steps then turned off, val loss is within 0–26% of the best method in every regime.
-   No other method stays within 30% everywhere.
-8. **A tiny byte-level language model shows the same early collapse, plus a pathway only deep models have.**
-   - Without balancing, 4.4 of 8 experts are effectively used and 2 are dead per layer by the end. Most of that
-     collapse is already there by step 250.
-   - Even with the router's weights *frozen*, the layers below learn to steer tokens onto a few experts.
-   - The standard balancing settings work there: aux α=0.01 or bias balancing. They close 71% of the gap between
-     a dense model with the MoE's active parameters and one with its total parameters, versus 34% without balancing.
-   - Unbalanced learned routing is no better than a fixed byte hash.
-   - Experts split up the byte vocabulary rather than the domains.
+   The resulting random-owner model, E·(1−1/E)^C dead experts, was **pre-registered and predicted dead-expert counts
+   in three never-seen regimes** (17.7 observed vs 19.3 predicted, 0.0 vs 0.3, 5.1 vs 5.7).
+4. **In deep models, upstream layers learn to steer tokens onto favoured experts.**
+   - With the router frozen, collapse still happens, slowly (median death step 750 in the LM).
+   - It disappears when the routing gradient is also blocked from reaching the representations: 0.1 dead experts
+     per layer, vs 4.9 with the router frozen alone.
+   - When the router can learn, though, its weights carry ~97% of the change in its logits.
+5. **Why SGD makes collapse much worse (77% dead vs 39% with Adam): mostly the router's unnormalised updates.**
+   Equalising each expert's router-gradient norm, plus normalising expert updates by load, brings SGD back to the
+   Adam baseline.
+6. **Balancing helps, if it is strong enough early. "Release after warm-up" is the most robust family, but the
+   specific recipe I proposed did not win the pre-registered test.**
+   - After per-method tuning, aux-then-release had the best worst case on held-out regimes (≤ 1.15× the best
+     method) and beat no balancing in 6 of 7.
+   - Sinkhorn-then-release narrowly had the better average (1.051 vs 1.064). Pre-registered P1: **fail**.
+7. **"Forcing balance hurts when experts outnumber skills or skills are skewed" only holds for strong balancing.**
+   With tuned (weaker) settings it did not generalise to held-out regimes (pre-registered P4: **fail**). Only strong
+   bias balancing and expert-choice routing hurt there.
+8. **When the router cannot see the task structure, no balancing method helps.** On tasks that aren't linearly
+   separable:
+   - learned routing recovers 14% of the task identity without upstream feature layers, and ~55% with them;
+   - every MoE closes under half of the gap to oracle routing;
+   - a dense model with the same total parameters does as well (0.249 vs 0.270 for the best MoE).
+
+   That is "dense in disguise" from failed specialisation, not imbalance.
+9. **In the 4-layer LM, any balancing helps, and the method matters little.**
+   - Aux α ∈ {0.003, 0.01, 0.03}, bias balancing and a fixed byte hash all land at 1.487–1.498 nats/byte, vs 1.526
+     unbalanced.
+   - Release did not help there (1.497).
+   - All MoEs close at most ~half the gap between dense-active (1.558) and dense-total (1.414).
 
 ---
 
@@ -128,6 +147,15 @@ For a dead expert (`f_i = 0`), the restoring push is proportional to its own rou
   that point. `α` is not scale-free: a value tuned for one loss scale is weak or strong for another.
 
 ## 3. Results
+
+> **Round-2 corrections to this section** (20 paired seeds, Holm-adjusted; see [round 2](#3b-round-2-attacking-the-limitations)):
+> - With 32 experts, identical expert initialisation *increases* collapse (+2.1 dead experts, p = 0.004) rather than
+>   having no effect.
+> - Zero-initialised expert outputs reliably *reduce* it (−1.7, p = 0.005).
+> - The router-LR and frozen-experts effects in E32 are not distinguishable from zero.
+> - With plentiful data the overfitting-gap correlation is ≈ 0 (−0.07), not −0.35.
+> - The tuned global aux α is 0.03, not 0.1.
+> - The claim that forced balance hurts when experts > skills did not survive the held-out test with tuned settings.
 
 All synthetic numbers are means over 8 seeds (± standard error). Each seed changes both the task and the
 initialisation. The regimes are:
@@ -329,62 +357,251 @@ Full table: [`results/summary_e3.md`](results/summary_e3.md).
 
 ![Domain routing](results/figures/e3_domain_routing.png)
 
+## 3b. Round 2: attacking the limitations
+
+Round 1 ended with a list of limitations. Round 2 turned each one into an experiment:
+
+| limitation (round 1) | what round 2 did | status |
+|---|---|---|
+| 8 seeds; small effects ambiguous | E1 v2: 20 paired seeds, bootstrap CIs, Holm-adjusted permutation tests | **resolved** (two round-1 calls corrected) |
+| SGD amplification untested | 2×2 factorial (which part uses SGD) + router row-norm / expert load-norm probes | **resolved** |
+| hyperparameters untuned | E4: grid per method, tuned on separate seeds and the validation split, reported on the test split | **resolved** for the synthetic suite |
+| release recipe tested on the regimes that suggested it | E5: frozen configs, 7 never-seen regimes, predictions committed before running | **resolved**; mixed result |
+| single layer, fixed inputs, linear tasks, MSE | E5/E6: deep MoE stacks, XOR tasks (not linearly separable), cross-entropy, top-2 | **resolved** at toy scale |
+| representation pathway unmeasured | logit decomposition (router weights vs representations), detach-input and freeze interventions | **resolved** at toy and small-LM scale |
+| toy LM, 2 seeds, no release | E3 v2: 4 layers, 16 experts, 3 seeds, release, decomposition, dense early logging; GPU preset shipped | **partly resolved** (see below) |
+| dense-equivalent saturates | "gap closed" between dense-active and oracle as the primary metric; power-law fit, with extrapolation marked | **resolved** |
+| CKA uninformative | metric validation on positive/negative redundancy controls | **resolved** |
+| "collapse might be late at scale" | death timing in the LM; E7 script for real OLMoE checkpoints | **open** at real scale (E7 not run, see below) |
+
+### E1 v2 – the mechanism with 20 paired seeds
+
+![Forest plot](results/figures/e1v2_forest.png)
+
+Comparisons are paired: each seed fixes the task and the initialisation across conditions. A direction is claimed
+only when the Holm-adjusted p < 0.05. Full table: [`results/summary_e1v2.md`](results/summary_e1v2.md).
+
+**Held up:**
+- Freezing the router prevents new deaths. With 32 experts it leaves 4.5 dead, all of them already dead at init.
+- Adam with expert gradients rescaled by load is identical to plain Adam.
+- Router warm-up, router LR and a head start have no clear effect.
+- One owner per task (1.00–1.03 experts per task).
+- Median death step 10.
+
+**Corrected:**
+- With 32 experts, identical expert initialisation *adds* 2.1 dead experts [1.2, 2.9].
+- Zero-initialised expert outputs *remove* 1.7 [1.0, 2.6].
+- In E8 neither is distinguishable from zero.
+
+**Where SGD's extra collapse comes from** (dead experts with 32 experts and 32 tasks; Adam everywhere = 12.3):
+
+| router | experts | dead | reading |
+|---|---|---|---|
+| SGD | Adam | 18.9 | SGD on the router alone adds +6.6 |
+| Adam | SGD | 12.7 | SGD on the experts alone adds nothing clear |
+| SGD | SGD | 24.3 | together +12.0: a strong interaction |
+| SGD, router rows equal-norm | SGD | 15.5 | equalising the router's per-expert gradient removes ~70% of the excess |
+| SGD, router rows equal-norm | SGD, load-normalised | 13.7 | ≈ the Adam baseline |
+
+Main effects (paired, averaged over the other factor): router SGD +9.1 [8.5, 9.7]; expert SGD +2.9 [2.5, 3.4];
+interaction +5.0 [4.0, 6.0].
+
+The mechanism: under SGD, a popular expert's router row receives a larger gradient, which accelerates the greedy
+race. Adam's per-parameter normalisation removes exactly that.
+
+### E4 – tuning every method
+
+Each method's hyperparameter grid was run on the four round-1 regimes, with tuning seeds 100–103 scored on the
+validation split. One *global* config per method was then chosen and evaluated on fresh seeds 0–9 on the test
+split. Full tables: [`results/summary_e4.md`](results/summary_e4.md).
+
+![Release grid](results/figures/e4_release_grid.png)
+
+- **Tuning barely changed the ranking.** Spearman ρ = 0.92 against round 1's untuned ranking.
+  - Aux-then-release is still most robust: geo-mean 1.08, worst 1.22.
+  - Next come bias-then-freeze (1.13), revive-dead (1.19) and sinkhorn-then-release (1.19).
+  - Continuous aux is 1.22 and no balancing is 1.46.
+- **The best α depends on the regime** ([sensitivity plot](results/figures/e4_sensitivity.png)). With 32
+  experts, the optimum is α ≈ 0.3. With more experts than skills, it is ≤ 0.01, where stronger balance splits skills.
+  That conflict is why a single strong setting can't be best everywhere, and why releasing after warm-up helps.
+- **The best global settings:**
+  - aux α = 0.03 (round 1 used 0.1);
+  - release after 1000 steps at α = 0.3;
+  - bias rate 0.1.
+
+  The best release step depends on the regime: 1000 for E32, 300 for E16C8 and Zipf. With 32 experts, releasing
+  too early is the costly mistake (up to 2× worse at step 50).
+- **"Gap closed" replaces the saturating dense-equivalent.** It is 0 for a dense model with the active parameters
+  and 1 for oracle routing.
+  - Aux-then-release and bias-then-freeze reach 0.98–1.00 on E8/E32/E16C8 (sinkhorn-then-release only 0.86 on E32).
+  - Nothing exceeds 0.95 on Zipf.
+
+**Which redundancy metrics work.** Each metric was tested on a positive control (forced balance: each task split
+across ~2 experts) against a negative control (free routing: one expert per task), on the same seeds:
+
+| metric | separates the controls? | standardised effect |
+|---|---|---|
+| CKA over a shared probe set (round 1's metric) | **no** | −0.24 |
+| CKA restricted to alive experts | barely | +0.55 |
+| CKA on each pair's *routed* tokens | yes | +5.7 |
+| substitution gap (how much worse the next-best expert is on an expert's own tokens) | yes | −8.8 |
+| useful experts ÷ alive experts (ablation) | yes | −1.5 |
+| experts per task (needs ground truth) | yes | +35.6 |
+
+Round 1's CKA was uninformative because it compared experts on inputs they never see.
+
+### E5 – the pre-registered held-out test
+
+[`experiments/PREREGISTRATION.md`](experiments/PREREGISTRATION.md) was committed (`dd7897a`) before any E5 run. It
+froze the global configs, seven new regimes and five predictions. Verdicts below are computed mechanically by
+`analyze2.py`. Full tables: [`results/summary_e5.md`](results/summary_e5.md).
+
+| id | prediction | result | verdict |
+|---|---|---|---|
+| P1 | aux-then-release has the lowest geo-mean ratio | sinkhorn-then-release 1.051, aux-then-release 1.064 | **FAIL** |
+| P2 | aux-then-release worst case ≤ 1.30 | 1.15 (the best worst-case of all 13 methods) | **PASS** |
+| P3 | aux-then-release beats no balancing in ≥ 6 of 7 regimes | 6 of 7 | **PASS** |
+| P4 | ≥ 3 of 4 continuous-balance methods worse than none (E32C16) | only bias and expert choice are worse | **FAIL** |
+| P4 | same, Zipf s = 0.8 | only bias and expert choice are worse | **FAIL** |
+| P5 | random-owner model predicts dead experts (E32C16 / E8C24 / CE16) | 17.7 vs 19.3 / 0.0 vs 0.3 / 5.1 vs 5.7 | **PASS** ×3 |
+
+What this means:
+- **The mechanism generalised (P5).** It held with twice as many experts as skills, with fewer experts than skills,
+  and under cross-entropy loss.
+- **"Balance early, then release" is the right family.** The two release variants are first and second on
+  average, and aux-then-release has the best worst case of any method.
+- **But "aux" is not the uniquely right balancer to release.** Sinkhorn-then-release did as well on average; it
+  was worse only on the XOR task (1.24).
+- **P4 failing means my round-1 warning was too broad.** With tuned, weaker settings, continuous aux and Sinkhorn
+  do *not* do worse than no balancing when experts outnumber skills or skills are skewed. Only strong bias balancing
+  (rate 0.1) and expert-choice routing did. The warning applies to strong, permanent balance pressure, not to
+  balancing per se.
+- **XOR tasks are a different failure.** Every MoE closes under half the gap to oracle routing (0.34–0.52). The
+  dense model with total parameters (0.249) is as good as the best MoE (0.270). The router can't find structure
+  that is invisible to it, so balance is not the bottleneck.
+
+### E6 – depth and the representation pathway
+
+Deep residual MoE stacks were trained on the synthetic tasks; every router sees learned representations. The
+interventions:
+- **frozen router:** removes the router-weight pathway;
+- **detach input:** the routing gradient cannot reach the representations;
+- **both together:** only incidental drift from the task loss remains.
+
+Full tables: [`results/summary_e6.md`](results/summary_e6.md); all three pre-registered E6 predictions passed.
+
+![Pathways](results/figures/e6_pathways.png)
+
+- **Freezing the router does not stop collapse in deep models.** It adds 1.0–1.3 dead experts per layer beyond
+  step 0, slowly, after ~step 300 (D1 pass, depths 2 and 4).
+- **Detaching the router input reduces dead experts:** −0.9 per layer at depth 2, −0.6 at depth 4 (D2 pass).
+  Freezing *and* detaching still lets dead experts creep up late at depth 4, so incidental drift contributes too.
+- **When the router learns, its weights dominate.** The logit decomposition attributes ~99% of the
+  routing-relevant change to the router weights. The representation pathway is slow, and it matters most when the
+  router is fixed or held back.
+- **Tasks the router can't see stay unrouted.** Without a dense pre-block, XOR routing recovers 14% of the task
+  information (D3 pass). With one, about 55%.
+- **The cosine router does not help in deep stacks.** It shifts more of the change to the representations and adds
+  dead experts at depth 4.
+
+### E3 v2 – a larger LM, with release and pathway probes
+
+**Setup.**
+- 4 layers, d_model 128, 16 experts × 64 (top-2); 3000 steps.
+- 3 seeds (2 for the α=0.003 and α=0.03 runs).
+- Scaled down from the planned 4000 steps × 4 seeds after measuring ~0.33 s/step on one CPU thread.
+
+Full table: [`results/summary_e3v2_cpu.md`](results/summary_e3v2_cpu.md).
+
+![LM dynamics](results/figures/e3v2_cpu_dynamics.png)
+
+| method | val loss (nats/byte) | gap closed (dense-active → dense-total) | dead / layer | late deaths / run |
+|---|---|---|---|---|
+| dense, active params | 1.558 | 0 | – | – |
+| dense, total params | 1.414 | 1 | – | – |
+| no balancing | 1.526 | 0.22 | 6.8 | 3.7 |
+| aux 0.003 / 0.01 / 0.03 | 1.498 / 1.492 / 1.488 | 0.42–0.49 | 0 | 0 |
+| aux-free bias | 1.489 | 0.48 | 0 | 0 |
+| aux 0.01 for 300 steps, then off | 1.497 | 0.42 | 0.7 | 2.7 |
+| bias for 300 steps, then frozen | 1.502 | 0.39 | 1.9 | 7.0 |
+| fixed byte hash | 1.487 | 0.49 | 0 | 0 |
+| router frozen | 1.590 | −0.22 | 4.9 | 15.3 |
+| router input detached | 1.536 | 0.15 | 5.8 | 5.7 |
+| frozen + detached | 1.622 | −0.44 | 0.1 | 0.3 |
+
+- **Timing.** Without balancing, dead experts per layer peak at 10.4 around step 100. 78% of eventually-dead
+  experts are dead by step 100, and only 1% die after step 1000. Unlike the synthetic tasks, the LM recovers
+  partly (6.8 dead per layer at the end, 20 revivals per run): the representations keep moving, so starved experts
+  occasionally get picked up again.
+- **Pathways.**
+  - The router's weights carry 97% of the routing-relevant logit change (rms 1.65 vs 0.26).
+  - Neither pathway alone reproduces the dead experts (1.9 and 0.5 vs 7.3 actual on the probe), so collapse comes
+    from the two moving *together*.
+  - With the router frozen, the representations alone collapse it slowly: 4.9 dead per layer, median death
+    step 750.
+  - With the input also detached, it doesn't collapse at all (0.1). In this LM it is specifically the routing
+    gradient pulling representations that does the damage.
+- **Release does not help here.**
+  - Every balancing method lands within noise of the others (s.e. up to 0.025).
+  - Releasing lets a few experts die late (0.7 per layer); freezing the bias, more (1.9).
+  - In this LM a fixed byte hash is as good as balanced learned routing. Learned routing's advantage over hashing
+    from round 1 does not appear at this scale.
+
+### E7 – real pretraining checkpoints (built, not run)
+
+`experiments/e7_real_checkpoints.py` loads a public MoE's intermediate checkpoints (default: OLMoE-1B-7B) and
+reports per-layer load, dead experts, and *router saturation* (overlap with the final checkpoint's top-k) across
+training. Caveats:
+- It was tested only on tiny randomly initialised OLMoE-architecture models, because Hugging Face is unreachable
+  from the environment that produced these results.
+- It needs a ≥ 24 GB GPU (cell in the Colab notebook).
+- OLMoE was trained *with* load balancing, so it can show when routing settles at scale, but not whether
+  unbalanced collapse is late.
+
 ## 4. What I'd actually do
 
-1. **Instrument from step 0.** The outcome is decided in the first ~1% of training, so a load chart from step 1000
-   onward tells you nothing about *why*. Log these per layer:
+1. **Instrument from step 0, per layer.** Log these:
    - effective experts and dead experts;
-   - router entropy and logit scale;
-   - ablation utility (dropping each expert in turn).
+   - router entropy;
+   - an ablation- or substitution-based redundancy measure (not plain CKA).
 
-   Compare every MoE against dense baselines at matched *active* and *total* parameters.
-2. **Balance the learning signal, not the load.** The thing worth guaranteeing is that every expert gets enough
-   tokens *early* to become competent. That means a balance term strong enough to win the first few hundred steps
-   (aux loss or bias balancing), then annealing it.
-   - α=0.01 was enough in the LM but far too weak in the synthetic task. Check effective experts at step ~100
-     rather than trusting a default.
-   - Permanent strict balance trades quality for even load whenever the data isn't uniformly structured.
-3. **Know which constraint you are paying for.** In production, balance is also a *systems* requirement: expert
-   parallelism, capacity limits and token dropping all assume roughly even load. That is a real reason to keep
-   some balance pressure, but it is a throughput argument, not a quality one. This lab doesn't model throughput.
-4. **Avoid known traps:**
-   - SGD on routers.
-   - Renormalised top-1 gates (no router gradient at all).
-   - Treating z-loss as a balancer.
-   - Treating Sinkhorn or expert-choice balance as evidence the router itself is healthy.
-   - Expert choice in autoregressive models (it uses future tokens).
-5. **Don't count on fixing the router.** In a deep model the representations do the collapsing too (E3), so the
-   balance pressure has to stay in the objective or in the selection rule.
-6. **Judge specialisation against token identity, not just domains.** At small scale, routing was mostly a function
-   of the current byte. A "domain expert" analysis would have found nothing and missed what the experts actually
-   split.
-7. **If you have more experts than distinct skills, dead experts aren't the disease.** Fewer, larger experts (or a
-   shared expert for common features) can beat forcing redundant experts to split each skill.
+   Most of the outcome is set in the first few percent of training. Compare against dense baselines at matched
+   *active* and *total* parameters, and report "gap closed".
+2. **Balance early and strongly enough, then relax rather than hold strict balance forever.**
+   - Release variants were the most robust family across 11 regimes.
+   - In the LM, keeping a modest aux loss on was just as good, and releasing let a few experts die late.
+   - A reasonable default: keep a *weak* balance term for the whole run, with a stronger one early (α≈0.03–0.3 in
+     the synthetic tasks; α≈0.01 was enough in the LM).
+   - Check effective experts at step ~100 instead of trusting any default α.
+3. **Use Adam-style optimizers for routers.** If you must use SGD, normalise per-expert router-row gradients.
+4. **In deep models, the representations are part of the router.** Freezing or fixing router weights does not
+   prevent collapse. Blocking the routing gradient into the representations (detach) reduces it at some cost. Keep
+   the balance pressure in the objective or the selection rule.
+5. **Avoid known traps:**
+   - renormalised top-1 gates (zero router gradient);
+   - z-loss as a balancer;
+   - strong permanent bias balancing on skewed data;
+   - expert-choice routing (non-causal, and fragile when skills are skewed);
+   - treating Sinkhorn's balanced selection as evidence the router itself is balanced. Release it and it can
+     collapse back.
+6. **If the router can't see the structure, balance won't create specialisation.** Check whether routing carries
+   information about anything meaningful: token identity, domain, or a ground-truth label. If it doesn't, an MoE
+   can be no better than a dense model with the same total parameters.
 
-## 5. Limits of this evidence (what would change these conclusions)
+## 5. Limits of this evidence (after round 2)
 
-- **The synthetic task is a single MoE layer on fixed inputs**, with linearly separable tasks and MSE loss.
-  - Deep models add a pathway these runs can't show: upstream layers can *move token representations* towards a
-    favoured expert (the representation collapse described by Chi et al., 2022).
-  - E3 probes this only at toy scale (2 layers, 8 experts, byte-level, 2500 steps, 2 seeds), and it didn't test
-    balance-then-release. That and more seeds are the obvious next LM runs; on a GPU they take minutes.
-- **Hyperparameters were not tuned per method:**
-  - aux α was swept over {1e-3, 1e-2, 1e-1, 1};
-  - the bias rate (1e-2), noise std (1.0) and release step (300) were set once, the last from E1's death timing.
-  - A method that looks mediocre here may be fine when tuned.
-- **The balance-then-release recipe was proposed *after* seeing E2's main results** and then tested on the same four
-  regimes. It is a hypothesis that survived one test, not one validated on held-out settings. The most useful next
-  experiment is to test it on new regimes and in a deeper model.
-- **8 seeds per cell.** Differences under ~2 standard errors (e.g. the router-LR and zero-init rows) should be read
-  as "no clear effect".
-- **"Dense-equivalent size" saturates in E8**, because wide dense MLPs nearly solve that task.
-- **CKA similarity between experts was computed but did not separate methods** (0.13–0.34 everywhere). The
-  ablation-based "useful experts" count turned out to be the informative redundancy measure.
-- The SGD result implies something besides expert-update size amplifies collapse under SGD. My guess is the
-  router's own un-normalised updates, but that is **untested**.
-- **What would most change my mind:** large-scale evidence that collapse mainly happens late in training, or is
-  driven by representation drift rather than an early per-skill race. In that case early-phase interventions like
-  balance-then-release would be the wrong lever.
+- **Scale.** Everything ran on 4 CPU cores. The largest LM has 4 layers, 16 experts, 3000 steps and 3 seeds;
+  differences among balancing methods there are within noise. The GPU preset (6 layers, 32 experts, 10k steps) is
+  shipped but only smoke-tested.
+- **Late collapse at real scale is still untested.** E7 is built but has not been run on real checkpoints; it also
+  only covers a model trained with balancing.
+- **The synthetic tasks are stylised.** Clusters or XOR bits with random teachers stand in for "skills"; real data
+  has graded, overlapping structure.
+- **Tuning used one grid per method on four regimes.** The held-out test used a single global config per method,
+  which is the fair comparison, but a method could do better tuned per setting.
+- **Round-2 design was also done after seeing data.** The held-out regimes and predictions were chosen after round
+  1, so pre-registration protects E5/E6 from tuning-to-results, not from my choice of what to test.
+- **The LM pathway result (frozen + detached ⇒ no collapse) rests on 3 seeds** of one architecture.
 
 ## 6. What's in the repo
 
@@ -393,54 +610,59 @@ moe_lab/
   moe.py              MoE layer. Every router reduces to a dispatch mask M[N,E] + combine weights G[N,E]:
                       softmax_topk (Switch), topk_renorm (Mixtral), sigmoid_topk (DeepSeek-V3), sinkhorn
                       (S-BASE), expert_choice, hash, oracle; linear or cosine (X-MoE) router; capacity factor;
-                      exploration noise; Switch aux loss (batch- or sequence-level); z-loss; aux-loss-free bias
-  data.py             synthetic mixture-of-tasks (C clusters × C random teacher nets), and 3-domain byte-level
-                      text (Shakespeare / Python stdlib source / CPython reference docs)
-  metrics.py          load, router entropy/logit scale, MI specialisation, CKA, Gini, Spearman
-  train_synthetic.py  trainer + interventions (frozen router/experts, router LR and warm-up, load-normalised
-                      grads, SGD, head start, zero-init, balance-then-release, dead-expert revival) + counterfactual
-                      diagnostics (every expert on every task, routing regret, per-expert overfitting, ablations)
-  train_lm.py         tiny MoE transformer trainer + per-layer / per-domain routing diagnostics
+                      exploration noise; Switch aux loss (batch- or sequence-level); z-loss; aux-loss-free bias;
+                      router_detach_input
+  data.py             synthetic mixture-of-tasks (clusters or XOR task ids; MSE or cross-entropy; train/val/test),
+                      and 3-domain byte-level text (Shakespeare / Python stdlib source / CPython reference docs)
+  models.py           single MoE layer, deep residual MoE stack (optional dense pre-block), MoE transformer
+  metrics.py          load, router entropy, MI specialisation, CKA / routed CKA, substitution gap, logit decomposition
+  stats.py            paired bootstrap CIs, sign-flip permutation tests, Holm correction
+  train_synthetic.py  trainer + interventions (frozen router/experts, router LR and warm-up, split router/expert
+                      optimizers, router row-norm, load-normalised grads, head start, zero-init, balance-then-release,
+                      dead-expert revival) + counterfactual diagnostics
+  train_lm.py         MoE transformer trainer + per-layer / per-domain routing diagnostics, dense early logging,
+                      logit decomposition, balance-then-release
 experiments/
-  e1_mechanisms.py    WHY: causal interventions on each link of the feedback loop + overfitting test
-  e2_fixes.py         FIXES: 18 methods × 4 regimes vs a dense-width sweep and oracle routing
-  e3_lm.py            LM: do the conclusions survive in a real (tiny) language model?
-  analyze.py          figures (results/figures) + tables (results/summary_e*.md) + per-run CSVs
-  run_all.sh          everything, resumable
-notebooks/moe_load_balancing_lab.ipynb   Colab driver (E3 runs on a GPU there)
-tests/test_moe.py     routing-math checks (aux loss = 1 at balance, gradient-flow facts, EC balance, …)
-results/              summary tables, figures, one CSV row per run (raw JSON is git-ignored)
+  e1_mechanisms.py    WHY: interventions on each link of the feedback loop (round 2: 20 seeds + SGD factorial)
+  e2_fixes.py         FIXES (round 1): 18 methods × 4 regimes
+  e3_lm.py            LM presets: round1 / cpu / gpu
+  e4_tuning.py        per-method tuning (tune → select → eval)
+  PREREGISTRATION.md  predictions for E5/E6, committed before they ran
+  e5_heldout.py       pre-registered held-out test (7 new regimes)
+  e6_deep.py          depth and the representation pathway
+  e7_real_checkpoints.py  routing across a real MoE's pretraining checkpoints (GPU + Hugging Face)
+  analyze.py, analyze2.py  figures, summary tables, per-run CSVs (round 1, round 2)
+notebooks/moe_load_balancing_lab.ipynb   Colab driver for the GPU LM preset and E7
+tests/test_moe.py     21 checks of the routing math, diagnostics and statistics
+results/              summary_*.md, figures/, runs_*.csv, tuned_configs.json (raw JSON is git-ignored)
 ```
 
-**Why a synthetic task with ground truth.** In real models you can't tell whether an expert is "specialised",
-because you don't know what the right specialisation is. Here, inputs come from C Gaussian clusters and each
-cluster has its own random teacher network. One small expert can't fit all C teachers; C specialised experts can.
-That gives three reference points:
-- **Oracle routing** (route by the true cluster id): what perfect specialisation buys.
-- **Dense MLPs of increasing width:** every MoE result is converted into a *dense-equivalent size*. A score near
-  one expert means the MoE is literally a dense model in disguise.
-- **Counterfactual losses:** every expert is evaluated on every task, so you can see which expert *would* have
-  been best and how far the router's choice is from it.
+**Why synthetic tasks with ground truth.** In real models you can't tell whether an expert is "specialised",
+because you don't know what the right specialisation is. Here each latent task has its own random teacher network.
+That makes three reference points possible:
+- **oracle routing** (route by the true task);
+- **dense baselines** at matched active and total parameters;
+- **counterfactual losses** (every expert on every task).
 
-**Running it:**
+**Running it** (CPU wall-clock on 4 cores):
 
 ```bash
-pip install -r requirements.txt
-python -m pytest -q tests
+pip install -r requirements.txt && python -m pytest -q tests
 cd experiments
-python e1_mechanisms.py --seeds 8     # ~20 min on 4 CPU cores
-python e2_fixes.py --seeds 8          # ~50 min
-python e3_lm.py --seeds 2             # ~1.5 h on CPU; on a GPU: --device cuda --workers 1
-python analyze.py                     # figures + tables into results/
+python e1_mechanisms.py                       # ~1.5 h (20 seeds)
+python e2_fixes.py --seeds 8                  # ~50 min (round 1)
+python e4_tuning.py tune && python e4_tuning.py select && python e4_tuning.py eval   # ~3 h
+python e5_heldout.py && python e6_deep.py     # ~3 h
+python e3_lm.py --preset cpu                  # ~4 h; GPU: --preset gpu --device cuda --workers 1
+python analyze.py && python analyze2.py
 ```
 
-Results are cached per run, so any script can be re-run to resume.
-- Raw per-run JSON, with full training curves, goes to `results/<exp>/` and is git-ignored because it is large.
+Results are cached per run, so every script resumes.
+- Raw per-run JSON goes to `results/<exp>/` and is git-ignored.
 - `results/runs_*.csv` holds every run's final metrics.
-- On Colab, open `notebooks/moe_load_balancing_lab.ipynb`.
 
-To try a new idea, add an option to `MoEConfig` / `_route` (or a trainer flag), add a line to `METHODS` in
-`e2_fixes.py`, and re-run: only the new runs execute.
+To try a new idea, add an option to `MoEConfig` / `_route` (or a trainer flag) and a grid entry in
+`e4_tuning.py`. Freeze it with `select` before testing it on held-out regimes.
 
 ## References
 

@@ -362,6 +362,11 @@ def _sensitivity_plot(tuned):
             ax.plot([parse(t) for t in xs], ys, "o-", color=SERIES[j], ms=4, lw=1.6, label=reg)
         ax.set_xscale("log")
         ax.set_yscale("log")
+        xs_num = [parse(t) for t in xs]
+        ax.set_xticks(xs_num, [f"{x:g}" for x in xs_num])
+        ax.xaxis.set_minor_formatter(plt.NullFormatter())
+        ax.yaxis.set_minor_formatter(plt.NullFormatter())
+        ax.set_yticks([0.1, 0.15, 0.2, 0.3, 0.5], ["0.1", "0.15", "0.2", "0.3", "0.5"])
         ax.set_xlabel(label)
         ax.set_title(f"{m}: val loss vs setting", loc="left")
     axes[0].set_ylabel("val loss (tuning seeds)")
@@ -540,6 +545,7 @@ def _e6_figure(g):
             y = np.mean([[np.mean([l["dead_experts"] for l in h["layers"]]) for h in r["history"]] for r in runs], axis=0)
             ax.plot(steps, y, color=SERIES[j], lw=2, label=c)
         ax.set_xscale("symlog", linthresh=10)
+        ax.set_xlim(0, steps[-1])
         ax.set_xlabel("training step")
         ax.set_ylabel("dead experts per layer")
         ax.set_title(fam, loc="left")
@@ -586,7 +592,7 @@ def analyze_e3v2(exp="e3v2_lm_cpu"):
          "routing stats averaged over MoE layers. *late deaths* = experts dead at the end whose last alive evaluation was",
          f"after 10% of training (step {total // 10}). *revived* = experts that were dead at some evaluation and alive at the end.\n",
          "| method | val loss | " + " | ".join(doms) + " | effective experts | dead / layer | useful experts | domain info | byte-explained | late deaths / run | revived / run | n |",
-         "|" + "---|" * (11 + len(doms))]
+         "|" + "---|" * (10 + len(doms))]
     from moe_lab.metrics import entropy_bits
 
     for m in E3V2_ORDER:
@@ -641,6 +647,8 @@ def _e3v2_figure(g, total, exp):
     axes[0].axvline(total // 10, color=INK2, lw=1, ls="--")
     axes[0].set_xscale("symlog", linthresh=25)
     axes[0].set_ylim(0, None)
+    for ax in axes:
+        ax.set_xlim(0, total)
     axes[0].set_xlabel("training step")
     axes[0].set_ylabel("effective experts (mean over layers)")
     axes[0].set_title("Load balance over training (dashed: release step)", loc="left")
@@ -655,8 +663,31 @@ def _e3v2_figure(g, total, exp):
     plt.close(fig)
 
 
+def export_csv():
+    """One row per run with every scalar final metric (raw JSONs are git-ignored)."""
+    import csv
+
+    for exp in ("e1v2_mechanisms", "e4_eval", "e5_heldout", "e6_deep", "e3v2_lm_cpu", "e3v2_lm_gpu"):
+        res = load_results(exp)
+        if not res:
+            continue
+        rows = []
+        for r in res:
+            row = {"name": r["config"]["name"], "seed": r["config"]["seed"]}
+            row.update({k: v for k, v in r["final"].items() if isinstance(v, (int, float))})
+            for li, l in enumerate(r["final"].get("layers", [])):
+                row.update({f"L{li}_{k}": v for k, v in l.items() if isinstance(v, (int, float))})
+            rows.append(row)
+        keys = list(dict.fromkeys(k for row in rows for k in row))
+        with open(OUT / f"runs_{exp}.csv", "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=keys)
+            w.writeheader()
+            w.writerows(rows)
+
+
 if __name__ == "__main__":
     FIG.mkdir(parents=True, exist_ok=True)
+    export_csv()
     analyze_e1v2()
     analyze_e4()
     analyze_e5()
