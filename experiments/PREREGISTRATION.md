@@ -64,4 +64,20 @@ the directional claims it is meant to test:
 
 ## Frozen configs (from E4, verbatim)
 
-<!-- FROZEN-CONFIGS -->
+| method | global tag | overrides | geo-mean ratio on tuning seeds (val) |
+|---|---|---|---|
+| none | `-` | `{}` | 1.417 |
+| aux | `a0.03` | `{"moe": {"aux_loss_coef": 0.03}}` | 1.169 |
+| zloss | `z0.0001` | `{"moe": {"z_loss_coef": 0.0001}}` | 1.402 |
+| explore_noise | `n1` | `{"moe": {"noise_std": 1.0}}` | 1.393 |
+| auxfree_bias | `u0.1` | `{"moe": {"bias_update_rate": 0.1}}` | 1.309 |
+| expert_choice | `-` | `{"moe": {"router": "expert_choice"}}` | 2.048 |
+| sinkhorn | `i1` | `{"moe": {"router": "sinkhorn", "sinkhorn_iters": 1}}` | 1.241 |
+| cosine_router | `s10` | `{"moe": {"router_type": "cosine", "cosine_scale": 10.0}}` | 1.277 |
+| revive_dead | `r100` | `{"revive_every": 100}` | 1.138 |
+| aux_then_release | `a0.3_t1000` | `{"moe": {"aux_loss_coef": 0.3}, "balance_until": 1000}` | 1.073 |
+| bias_then_freeze | `u0.03_t300` | `{"moe": {"bias_update_rate": 0.03}, "balance_until": 300}` | 1.084 |
+| sinkhorn_then_release | `t1000` | `{"moe": {"router": "sinkhorn"}, "balance_until": 1000}` | 1.198 |
+| hash_fixed | `-` | `{"moe": {"router": "hash"}}` | 3.044 |
+
+SHA-256 of `results/tuned_configs.json` at registration: `e28f52f40683884d962a2a63da33b5a41c72354f68a21b103b3dd9fceeb020d9`
