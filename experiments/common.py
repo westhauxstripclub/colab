@@ -30,6 +30,7 @@ def _worker(kind: str, cfg: dict, path: str, threads: int):
     import torch
 
     torch.set_num_threads(threads)
+    cfg = {**cfg, "device": assign_device(cfg.get("device", "cpu"), _WORKER_GPU)} if "device" in cfg else cfg
     try:
         if kind == "synthetic":
             from moe_lab.train_synthetic import SynthRunConfig, run_synthetic
@@ -48,6 +49,30 @@ def _worker(kind: str, cfg: dict, path: str, threads: int):
     return path, None
 
 
+def require_cuda(device: str):
+    """Exit with one clear message (instead of one traceback per run) when a CUDA device is asked for but absent."""
+    import torch
+
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
+        sys.exit(f"--device {device} requested but no CUDA GPU is available in this session "
+                 "(on Kaggle: Settings -> Accelerator -> GPU T4 x2, then restart).")
+
+
+_WORKER_GPU = None  # set per worker process by _init_worker when a grid runs on CUDA
+
+
+def _init_worker(gpu_ids):
+    global _WORKER_GPU
+    _WORKER_GPU = gpu_ids.get()
+
+
+def assign_device(device: str, gpu: int | None) -> str:
+    """Plain 'cuda' becomes this worker's own GPU (cuda:0, cuda:1, ...); an explicit 'cuda:N' or 'cpu' is kept."""
+    if device == "cuda" and gpu is not None:
+        return f"cuda:{gpu}"
+    return device
+
+
 def run_grid(kind: str, exp: str, configs: list[dict], workers: int = 4, threads: int = 1):
     out_dir = RESULTS / exp
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -57,7 +82,22 @@ def run_grid(kind: str, exp: str, configs: list[dict], workers: int = 4, threads
         if not path.exists():
             todo.append((cfg, str(path)))
     print(f"[{exp}] {len(configs)} runs, {len(configs) - len(todo)} cached, {len(todo)} to run", flush=True)
-    with ProcessPoolExecutor(max_workers=workers) as ex:
+    pool = dict(max_workers=workers)
+    if any(str(cfg.get("device", "cpu")).startswith("cuda") for cfg, _ in todo):
+        import multiprocessing
+
+        import torch
+
+        # One GPU per worker process (so --workers 2 on T4 x2 uses both cards, one run each); spawn because CUDA is
+        # not fork-safe once the parent has queried it.
+        ctx = multiprocessing.get_context("spawn")
+        gpu_ids = ctx.Queue()
+        n_gpus = max(1, torch.cuda.device_count())
+        for i in range(workers):
+            gpu_ids.put(i % n_gpus)
+        pool.update(mp_context=ctx, initializer=_init_worker, initargs=(gpu_ids,))
+        print(f"[{exp}] {workers} worker(s) over {n_gpus} GPU(s)", flush=True)
+    with ProcessPoolExecutor(**pool) as ex:
         futs = [ex.submit(_worker, kind, cfg, path, threads) for cfg, path in todo]
         for i, fut in enumerate(as_completed(futs), 1):
             path, err = fut.result()

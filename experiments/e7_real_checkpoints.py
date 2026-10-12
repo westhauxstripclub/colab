@@ -11,12 +11,15 @@ This tests the round-1 claim that routing outcomes are fixed early. Caveat: OLMo
 balancing, so it shows when routing settles under balancing; it cannot show unbalanced collapse at scale.
 
 STATUS: tested in this repo only against tiny randomly initialised OLMoE-architecture models (--local_dirs); it has
-not been run on the real checkpoints here because huggingface.co is not reachable from the build environment.
-Memory: OLMoE-1B-7B is ~14 GB in bf16; use a >= 24 GB GPU (A100/L4) or --device_map auto with CPU offload.
+not yet completed on the real checkpoints.
+Memory: OLMoE-1B-7B is 13.8 GB in 16-bit. One >= 24 GB GPU (A100/L4) holds it; on two 15 GB cards (Kaggle T4 x2) use
+--device_map auto to split the layers across both. T4/P100 have no native bf16, so use --dtype float16 there; the
+script stops if any router logit is non-finite (a float16 overflow) rather than reporting metrics from it.
 
 Usage:
   pip install -r requirements-colab.txt
   python e7_real_checkpoints.py --repo allenai/OLMoE-1B-7B-0924 --max_checkpoints 10 --device cuda
+  python e7_real_checkpoints.py --max_checkpoints 10 --dtype float16 --device_map auto     # Kaggle T4 x2
   python e7_real_checkpoints.py --local_dirs ckpt_a ckpt_b --tokenizer bytes          # offline test
 """
 from __future__ import annotations
@@ -88,6 +91,10 @@ def route(model, ids, batch_size, device):
     for i in range(0, len(ids), batch_size):
         out = model(input_ids=ids[i : i + batch_size].to(device), output_router_logits=True)
         logits = [l.float().cpu() for l in out.router_logits]
+        bad = [li for li, l in enumerate(logits) if not torch.isfinite(l).all()]
+        if bad:
+            raise FloatingPointError(f"non-finite router logits in layers {bad} (dtype {model.dtype}); "
+                                     "float16 can overflow on a bf16-trained model -- try --dtype bfloat16 or float32")
         per_layer = logits if per_layer is None else [torch.cat([a, b]) for a, b in zip(per_layer, logits)]
     return per_layer
 
@@ -121,9 +128,16 @@ def main():
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device_map", default=None,
+                    help="e.g. 'auto': let accelerate split the model over all visible GPUs (overrides --device)")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+    wants_cuda = str(a.device).startswith("cuda") if a.device_map is None else a.device_map not in ("cpu",)
+    if wants_cuda and not torch.cuda.is_available():  # before any multi-GB download
+        asked = f"--device_map {a.device_map}" if a.device_map else f"--device {a.device}"
+        sys.exit(f"{asked} needs a CUDA GPU but none is available "
+                 "(on Kaggle: Settings -> Accelerator -> GPU T4 x2, then restart).")
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -147,12 +161,17 @@ def main():
     results, topks_all = [], []
     for label, kw in sources:
         print(f"loading {label} ...", flush=True)
-        model = AutoModelForCausalLM.from_pretrained(**kw, dtype=dtype).to(a.device).eval()
+        if a.device_map is None:
+            model = AutoModelForCausalLM.from_pretrained(**kw, dtype=dtype).to(a.device).eval()
+            in_device = a.device
+        else:
+            model = AutoModelForCausalLM.from_pretrained(**kw, dtype=dtype, device_map=a.device_map).eval()
+            in_device = model.device  # where the embedding layer lives; accelerate moves activations between cards
         if ids is None:
             ids = tokenize(texts, tokenizer, a.seq_len, model.config.vocab_size)
             token_domains = np.repeat(np.array(domains), ids.shape[1])
         k = model.config.num_experts_per_tok
-        layers, topks = analyse(route(model, ids, a.batch_size, a.device), k, token_domains)
+        layers, topks = analyse(route(model, ids, a.batch_size, in_device), k, token_domains)
         results.append({"checkpoint": label, "step": parse_step(label), "layers": layers})
         topks_all.append(topks)
         del model

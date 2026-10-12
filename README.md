@@ -68,6 +68,11 @@ Where round 2 contradicted round 1, this README says so.
      unbalanced.
    - Release did not help there (1.497).
    - All MoEs close at most ~half the gap between dense-active (1.558) and dense-total (1.414).
+   - The 6-layer, 32-expert GPU preset (Kaggle T4, 19 of 21 runs) does **not** confirm this. It is data-limited: about
+     55 passes over a 1.5 MB corpus, so every model's val loss bottoms out around step 2000–4000 and then rises.
+     At each run's best checkpoint, every method lands at 1.340–1.354, dense models included, and every paired 95%
+     CI against no balancing includes 0. Its routing results do replicate (early collapse, the router's weights
+     carry ~94% of the logit change).
 
 ---
 
@@ -369,10 +374,10 @@ Round 1 ended with a list of limitations. Round 2 turned each one into an experi
 | release recipe tested on the regimes that suggested it | E5: frozen configs, 7 never-seen regimes, predictions committed before running | **resolved**; mixed result |
 | single layer, fixed inputs, linear tasks, MSE | E5/E6: deep MoE stacks, XOR tasks (not linearly separable), cross-entropy, top-2 | **resolved** at toy scale |
 | representation pathway unmeasured | logit decomposition (router weights vs representations), detach-input and freeze interventions | **resolved** at toy and small-LM scale |
-| toy LM, 2 seeds, no release | E3 v2: 4 layers, 16 experts, 3 seeds, release, decomposition, dense early logging; GPU preset shipped | **partly resolved** (see below) |
+| toy LM, 2 seeds, no release | E3 v2: 4 layers, 16 experts, 3 seeds, release, decomposition, dense early logging; GPU preset run on a Kaggle T4 (19/21 runs) | **partly resolved**: routing replicates; the GPU preset is data-limited and can't rank methods (see below) |
 | dense-equivalent saturates | "gap closed" between dense-active and oracle as the primary metric; power-law fit, with extrapolation marked | **resolved** |
 | CKA uninformative | metric validation on positive/negative redundancy controls | **resolved** |
-| "collapse might be late at scale" | death timing in the LM; E7 script for real OLMoE checkpoints | **open** at real scale (E7 not run, see below) |
+| "collapse might be late at scale" | death timing in the LM (CPU and GPU presets); E7 script for real OLMoE checkpoints | **open** at real scale (E7 not run yet, see below) |
 
 ### E1 v2 – the mechanism with 20 paired seeds
 
@@ -547,14 +552,63 @@ Full table: [`results/summary_e3v2_cpu.md`](results/summary_e3v2_cpu.md).
   - In this LM a fixed byte hash is as good as balanced learned routing. Learned routing's advantage over hashing
     from round 1 does not appear at this scale.
 
-### E7 – real pretraining checkpoints (built, not run)
+#### GPU preset (Kaggle T4, 19 of 21 runs)
+
+**Setup.**
+- 6 layers, d_model 256, 32 experts × 128 (top-2), context 256, 10k steps, lr 1e-3, 3 seeds.
+- Run on one Kaggle T4. Per run that took about 13.5 min for `dense_active`, 36–42 min for an MoE and 47 min for
+  `dense_total`.
+- Kaggle's 12 h limit stopped the run before `detach_input` seeds 1–2, so that method has n = 1.
+
+Full tables: [`results/summary_e3v2_gpu.md`](results/summary_e3v2_gpu.md).
+
+![GPU LM dynamics](results/figures/e3v2_gpu_dynamics.png)
+
+**The preset overfits, so its final losses can't be compared.** The training text is ~1.5 MB (550 KB per domain
+minus 10% validation), and 10k × 32 × 256 bytes is ~55 passes over it.
+- Every run's val loss bottoms out between steps 1500 and 4500, then rises until the end.
+- Final val loss ranges from 1.56 (`frozen_router`) to 3.43 (`dense_total`). That ordering tracks how fast each
+  model memorises, not how well it models text.
+
+| method | best val (nats/byte) | step of best | final val | dead / layer at end | n |
+|---|---|---|---|---|---|
+| dense, active params | 1.341 ± 0.008 | 3500–4000 | 1.603 | – | 3 |
+| dense, total params | 1.347 ± 0.004 | 1500–2000 | 3.433 | – | 3 |
+| no balancing | 1.354 ± 0.009 | 3000–3500 | 1.768 | 15.5 | 3 |
+| aux 0.01 | 1.340 ± 0.006 | 2000–2500 | 2.459 | 0 | 3 |
+| aux 0.01 for 1000 steps, then off | 1.342 ± 0.004 | 2000–2500 | 2.451 | 5.2 | 3 |
+| router frozen | 1.350 ± 0.014 | 3500–4500 | 1.556 | 22.4 | 3 |
+| router input detached | 1.348 | 3000 | 1.771 | 16.2 | 1 |
+
+*Best val* is selected on the same val split it's reported on, so it is slightly optimistic, equally for every
+method.
+
+- **No method is distinguishable at its best checkpoint.** Paired by seed against no balancing, aux 0.01 is −0.013
+  [−0.035, +0.015] and release −0.011 [−0.029, +0.012]. Even `dense_total`, with 5.6× the parameters of
+  `dense_active`, is no better. The corpus is too small to reward capacity, so it can't reward balancing either.
+- **Collapse replicates, early.** Without balancing:
+  - seed 0 already has 24.8 of 32 experts dead per layer at step 50;
+  - the median death step is 50, and 66% of deaths happen by step 100;
+  - experts partly revive later (15.7 dead per layer at the end, ~60 revivals per run). That is the same "early race,
+    partial recovery" as the CPU preset, at a larger scale.
+- **Pathways replicate.**
+  - The router's weights carry ~94% of the routing-relevant logit change (CPU: 97%).
+  - Neither pathway alone reproduces the dead experts (3.7 and 3.9 vs 15.8 on the probe).
+  - With the router frozen, the representations still collapse it, more slowly (median death step 650; CPU: 750)
+    but further (22.4 dead per layer at the end).
+  - The frozen + detached control that stopped collapse in the CPU preset was not run here.
+- **Release:** all experts that die under release do so after the release step (5.2 dead per layer at the end), as in
+  the CPU preset.
+
+### E7 – real pretraining checkpoints (built, not run yet)
 
 `experiments/e7_real_checkpoints.py` loads a public MoE's intermediate checkpoints (default: OLMoE-1B-7B) and
 reports per-layer load, dead experts, and *router saturation* (overlap with the final checkpoint's top-k) across
 training. Caveats:
 - It was tested only on tiny randomly initialised OLMoE-architecture models, because Hugging Face is unreachable
   from the environment that produced these results.
-- It needs a ≥ 24 GB GPU (cell in the Colab notebook).
+- It needs a ≥ 24 GB GPU, or two 15 GB cards with `--device_map auto` (Kaggle T4 ×2; cell in the notebook). The
+  first Kaggle attempt had no GPU attached; the second spent its 12 h on the E3 v2 GPU preset before reaching E7.
 - OLMoE was trained *with* load balancing, so it can show when routing settles at scale, but not whether
   unbalanced collapse is late.
 
@@ -590,9 +644,14 @@ training. Caveats:
 
 ## 5. Limits of this evidence (after round 2)
 
-- **Scale.** Everything ran on 4 CPU cores. The largest LM has 4 layers, 16 experts, 3000 steps and 3 seeds;
-  differences among balancing methods there are within noise. The GPU preset (6 layers, 32 experts, 10k steps) is
-  shipped but only smoke-tested.
+- **Scale.** Everything except the GPU LM preset ran on 4 CPU cores. The largest CPU LM has 4 layers, 16 experts,
+  3000 steps and 3 seeds; differences among balancing methods there are within noise.
+- **The GPU LM preset is data-limited.** 6 layers, 32 experts, 10k steps on one Kaggle T4, 19 of 21 runs, 3 seeds
+  (1 for `detach_input`). It makes ~55 passes over ~1.5 MB of training text, so val loss rises after step ~3000 in
+  every run. Method comparisons need more data or fewer steps.
+- **The CPU LM preset may be near the same turn.** It processes ~12M bytes (~8 passes). In the GPU preset that is
+  roughly where `dense_total` was already at its best and turning up. The CPU run's raw per-step histories aren't in
+  the repo, so I can't check whether its final-checkpoint ranking (dense-total best) is affected.
 - **Late collapse at real scale is still untested.** E7 is built but has not been run on real checkpoints; it also
   only covers a model trained with balancing.
 - **The synthetic tasks are stylised.** Clusters or XOR bits with random teachers stand in for "skills"; real data
@@ -632,8 +691,8 @@ experiments/
   e6_deep.py          depth and the representation pathway
   e7_real_checkpoints.py  routing across a real MoE's pretraining checkpoints (GPU + Hugging Face)
   analyze.py, analyze2.py  figures, summary tables, per-run CSVs (round 1, round 2)
-notebooks/moe_load_balancing_lab.ipynb   Colab driver for the GPU LM preset and E7
-tests/test_moe.py     21 checks of the routing math, diagnostics and statistics
+notebooks/moe_load_balancing_lab.ipynb   Kaggle/Colab driver for the GPU LM preset and E7
+tests/test_moe.py     22 checks of the routing math, diagnostics, statistics and GPU assignment
 results/              summary_*.md, figures/, runs_*.csv, tuned_configs.json (raw JSON is git-ignored)
 ```
 
@@ -653,12 +712,13 @@ python e1_mechanisms.py                       # ~1.5 h (20 seeds)
 python e2_fixes.py --seeds 8                  # ~50 min (round 1)
 python e4_tuning.py tune && python e4_tuning.py select && python e4_tuning.py eval   # ~3 h
 python e5_heldout.py && python e6_deep.py     # ~3 h
-python e3_lm.py --preset cpu                  # ~4 h; GPU: --preset gpu --device cuda --workers 1
+python e3_lm.py --preset cpu                  # ~4 h; GPU: --preset gpu --device cuda --workers <n GPUs>
 python analyze.py && python analyze2.py
 ```
 
 Results are cached per run, so every script resumes.
-- Raw per-run JSON goes to `results/<exp>/` and is git-ignored.
+- Raw per-run JSON goes to `results/<exp>/` and is git-ignored, except the GPU LM runs (`results/e3v2_lm_gpu/`),
+  which cost 12 GPU-hours to produce.
 - `results/runs_*.csv` holds every run's final metrics.
 
 To try a new idea, add an option to `MoEConfig` / `_route` (or a trainer flag) and a grid entry in
