@@ -11,7 +11,7 @@ Presets:
 """
 import argparse
 
-from common import ROOT, run_grid
+from common import ROOT, require_cuda, run_grid
 
 PRESETS = {
     "round1": dict(exp="e3_lm", seeds=2, run=dict(steps=2500), moe=dict(n_experts=8, d_hidden=128, top_k=2)),
@@ -84,8 +84,10 @@ if __name__ == "__main__":
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--data_dir", default=str(ROOT / "data"))
-    ap.add_argument("--device", default="cpu", help="'cuda' on a Colab GPU (use --workers 1)")
+    ap.add_argument("--device", default="cpu",
+                    help="'cuda' on a GPU; with --workers N each worker gets its own GPU (cuda:0, cuda:1, ...)")
     a = ap.parse_args()
+    require_cuda(a.device)
     P = PRESETS[a.preset]
     run_grid("lm", P["exp"], configs(a.preset, a.seeds or P["seeds"], a.data_dir, a.device, a.methods),
              workers=a.workers, threads=a.threads)

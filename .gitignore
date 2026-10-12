@@ -7,4 +7,5 @@ data/
 results/*/
 !results/figures/
 !results/e7_real_checkpoints/
+!results/e3v2_lm_gpu/
 results/*_log.txt

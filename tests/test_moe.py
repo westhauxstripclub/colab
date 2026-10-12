@@ -230,3 +230,11 @@ def test_single_expert_dense_baseline_runs_with_all_diagnostics():
     r = run_synthetic(SynthRunConfig(name="t", steps=5, eval_every=5, snapshot_steps=(0,),
                                      moe=dict(n_experts=1, top_k=1, router="topk_renorm", d_hidden=4)))
     assert math.isnan(r["final"]["substitution_gap"])
+
+
+def test_grid_workers_each_get_their_own_gpu():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
+    from common import assign_device
+
+    assert [assign_device("cuda", g) for g in (0, 1)] == ["cuda:0", "cuda:1"]
+    assert assign_device("cuda:1", 0) == "cuda:1" and assign_device("cpu", 1) == "cpu" and assign_device("cuda", None) == "cuda"

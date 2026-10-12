@@ -228,7 +228,10 @@ def analyze_e4():
 
     g = group(load_results("e4_eval"))
     if not g:
-        (OUT / "summary_e4.md").write_text("\n".join(L) + "\n")
+        if (OUT / "summary_e4.md").exists():  # raw eval JSONs are git-ignored: don't clobber the committed full summary
+            print("summary_e4.md kept: no raw results/e4_eval/*.json here to rebuild its evaluation tables from")
+        else:
+            (OUT / "summary_e4.md").write_text("\n".join(L) + "\n")
         return
     test = lambda name: [V(r, "test_loss") for r in g.get(name, [])]  # noqa: E731
     L += ["\n## Test loss on evaluation seeds (global config; per-regime-tuned config in brackets when different)\n",
@@ -615,6 +618,8 @@ def analyze_e3v2(exp="e3v2_lm_cpu"):
                  f"{fmt(*useful, 2)} | {fmt(*Lm('domain_info_recovered'), 2)} | {fmt(*Lm('routing_explained_by_byte'), 2)} | "
                  f"{np.mean(late):.2f} | {np.mean(rev):.2f} | {len(runs)} |")
 
+    L += _e3v2_best_checkpoint(g, total)
+
     L += ["\n## Which pathway moves the router logits? (none / frozen router / detached input, final checkpoint)\n",
           "| method | rms change from reps | rms change from router weights | rep share | dead if only reps moved | dead if only router moved | dead (actual, probe) |",
           "|---|---|---|---|---|---|---|"]
@@ -627,6 +632,38 @@ def analyze_e3v2(exp="e3v2_lm_cpu"):
                  f"{fmt(*D('dead_rep_only'), 2)} | {fmt(*D('dead_router_only'), 2)} | {fmt(*D('dead_both'), 2)} |")
     _e3v2_figure(g, total, exp)
     (OUT / f"summary_{exp.replace('_lm', '')}.md").write_text("\n".join(L) + "\n")
+
+
+def _e3v2_best_checkpoint(g, total):
+    """Val loss at its minimum over training vs at the end. If it bottoms out early and then rises, the final-checkpoint
+    table above compares how much each model overfits, not how well it models text."""
+    rows, best_steps = [], []
+    for m in E3V2_ORDER:
+        runs = g.get(m)
+        if not runs:
+            continue
+        best = [min(r["history"], key=lambda h: h["val_loss"]) for r in runs]
+        best_steps += [b["step"] for b in best]
+        layer_stat = lambda h, k: np.mean([l[k] for l in h["layers"]]) if h.get("layers") and k in h["layers"][0] else np.nan  # noqa: E731
+        moe = runs[0]["moe_config"]["n_experts"] > 1
+        rows.append(f"| {m} | {fmt(*mean_se([b['val_loss'] for b in best]))} | {', '.join(str(b['step']) for b in best)} | "
+                    f"{fmt(*mean_se([r['final']['val_loss'] for r in runs]))} | "
+                    f"{np.mean([r['final']['val_loss'] - b['val_loss'] for r, b in zip(runs, best)]):+.3f} | "
+                    + (f"{fmt(*mean_se([layer_stat(b, 'effective_experts') for b in best]), 2)} | "
+                       f"{fmt(*mean_se([layer_stat(b, 'dead_experts') for b in best]), 2)} |" if moe else "– | – |")
+                    + f" {len(runs)} |")
+    if not rows:
+        return []
+    L = ["\n## Best checkpoint vs final checkpoint\n",
+         "*best val* = lowest val loss over all evaluations (selected on the same val split, so slightly optimistic, equally",
+         "for every method); routing stats are at that checkpoint.\n"]
+    if np.median(best_steps) < 0.5 * total:
+        L += [f"**Overfitting:** val loss bottoms out at a median step of {int(np.median(best_steps))} of {total} and rises "
+              "afterwards, so the final-checkpoint losses above measure how much each model overfits rather than how "
+              "well it models the text. Compare methods on *best val* here.\n"]
+    L += ["| method | best val | step of best (per seed) | final val | final − best | effective experts at best | "
+          "dead / layer at best | n |", "|---|---|---|---|---|---|---|---|"] + rows
+    return L
 
 
 def _e3v2_figure(g, total, exp):
