@@ -25,14 +25,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
 
-import numpy as np
-import torch
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # read at the first CUDA allocation
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -117,6 +120,46 @@ def saturation(top_t, top_final, k):
     return float(eq.float().sum(-1).mean() / k)
 
 
+def gpu_mem() -> str:
+    return ", ".join(f"cuda:{i} {torch.cuda.memory_allocated(i) / 2**30:.1f} GiB" for i in range(torch.cuda.device_count()))
+
+
+def free_model():
+    """Release the previous checkpoint. A model dispatched over several GPUs can survive `del` via reference cycles
+    (accelerate hooks), which made the second OLMoE checkpoint run out of memory on Kaggle T4 x2."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        left = max(torch.cuda.memory_allocated(i) for i in range(torch.cuda.device_count()))
+        print(f"  freed: {gpu_mem()}", flush=True)
+        if left > 2**30:
+            raise RuntimeError(f"previous checkpoint still holds GPU memory after freeing ({gpu_mem()})")
+
+
+def max_memory(headroom_gib: float):
+    """Per-GPU budget for device_map, leaving room for transformers' load-time conversion buffers (the fused expert
+    weights are concatenated on the GPU, 512 MiB at a time for OLMoE)."""
+    return {i: f"{max(1.0, torch.cuda.get_device_properties(i).total_memory / 2**30 - headroom_gib):.1f}GiB"
+            for i in range(torch.cuda.device_count())}
+
+
+def load_cached(cache: Path, label: str, params: dict):
+    j, z = cache / f"{label}.json", cache / f"{label}.npz"
+    if not (j.exists() and z.exists()):
+        return None
+    res = json.loads(j.read_text())
+    if res.pop("params") != params:
+        return None
+    arr = np.load(z)["topk"]
+    return res, [torch.from_numpy(a.astype(np.int64)) for a in arr]
+
+
+def save_cached(cache: Path, label: str, params: dict, res: dict, topks):
+    cache.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache / f"{label}.npz", topk=np.stack([t.numpy().astype(np.uint8) for t in topks]))
+    (cache / f"{label}.json").write_text(json.dumps({**res, "params": params}))  # written last: marks it complete
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="allenai/OLMoE-1B-7B-0924")
@@ -130,6 +173,8 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--device_map", default=None,
                     help="e.g. 'auto': let accelerate split the model over all visible GPUs (overrides --device)")
+    ap.add_argument("--headroom_gib", type=float, default=3.0,
+                    help="with --device_map: GPU memory per card left free for load-time buffers")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -156,35 +201,50 @@ def main():
     tokenizer = a.tokenizer if a.tokenizer == "bytes" else AutoTokenizer.from_pretrained(
         a.local_dirs[-1] if a.local_dirs else a.repo)
 
+    out = Path(a.out) if a.out else OUT_DIR / f"{slug}.json"
+    cache = out.parent / out.stem  # one file pair per finished checkpoint, so a crash or timeout loses nothing
+    params = dict(n_chunks=a.n_chunks, chunk_chars=a.chunk_chars, seq_len=a.seq_len, tokenizer=str(a.tokenizer))
     texts, domains, domain_names = text_sample(a.n_chunks, a.chunk_chars)
     ids = None
     results, topks_all = [], []
     for label, kw in sources:
+        cached = load_cached(cache, label, params)
+        if cached:
+            print(f"cached {label}", flush=True)
+            results.append(cached[0])
+            topks_all.append(cached[1])
+            continue
         print(f"loading {label} ...", flush=True)
         if a.device_map is None:
             model = AutoModelForCausalLM.from_pretrained(**kw, dtype=dtype).to(a.device).eval()
             in_device = a.device
         else:
-            model = AutoModelForCausalLM.from_pretrained(**kw, dtype=dtype, device_map=a.device_map).eval()
+            extra = dict(max_memory=max_memory(a.headroom_gib)) if a.device_map != "cpu" else {}
+            model = AutoModelForCausalLM.from_pretrained(**kw, dtype=dtype, device_map=a.device_map, **extra).eval()
             in_device = model.device  # where the embedding layer lives; accelerate moves activations between cards
+        if torch.cuda.is_available():
+            print(f"  loaded: {gpu_mem()}", flush=True)
         if ids is None:
             ids = tokenize(texts, tokenizer, a.seq_len, model.config.vocab_size)
             token_domains = np.repeat(np.array(domains), ids.shape[1])
         k = model.config.num_experts_per_tok
         layers, topks = analyse(route(model, ids, a.batch_size, in_device), k, token_domains)
-        results.append({"checkpoint": label, "step": parse_step(label), "layers": layers})
+        res = {"checkpoint": label, "step": parse_step(label), "layers": layers, "n_tokens": int(ids.numel())}
+        save_cached(cache, label, params, res, topks)
+        results.append(res)
         topks_all.append(topks)
         del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        free_model()
     for res, topks in zip(results, topks_all):
         for st, t, tf in zip(res["layers"], topks, topks_all[-1]):
             st["saturation_vs_final"] = saturation(t, tf, t.shape[1])
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = Path(a.out) if a.out else OUT_DIR / f"{slug}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    n_tokens = results[0].pop("n_tokens")
+    for r in results[1:]:
+        r.pop("n_tokens")
     out.write_text(json.dumps({"repo": None if a.local_dirs else a.repo, "domains": list(domain_names),
-                               "n_tokens": int(ids.numel()), "checkpoints": results}, indent=1))
+                               "n_tokens": n_tokens, "checkpoints": results}, indent=1))
     print(f"wrote {out}")
     for r in results:
         L = r["layers"]
