@@ -238,3 +238,43 @@ def test_grid_workers_each_get_their_own_gpu():
 
     assert [assign_device("cuda", g) for g in (0, 1)] == ["cuda:0", "cuda:1"]
     assert assign_device("cuda:1", 0) == "cuda:1" and assign_device("cpu", 1) == "cpu" and assign_device("cuda", None) == "cuda"
+
+
+def test_real_checkpoint_gpu_budget_leaves_headroom(monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
+    import types
+
+    import e7_real_checkpoints as e7
+
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: types.SimpleNamespace(total_memory=14.56 * 2**30))
+    assert e7.max_memory(3.0) == {0: "11.6GiB", 1: "11.6GiB"}
+
+
+def test_real_checkpoint_cache_resumes_and_matches(tmp_path):
+    transformers = pytest.importorskip("transformers")
+    import subprocess
+
+    if not (Path(__file__).resolve().parents[1] / "data" / "shakespeare.txt").exists():
+        pytest.skip("needs data/shakespeare.txt (downloaded by the first E3/E7 run)")
+
+    dirs = []
+    for i, name in enumerate(["step100-tok1B", "step900-tok9B"]):
+        torch.manual_seed(i)
+        cfg = transformers.OlmoeConfig(vocab_size=256, hidden_size=32, intermediate_size=16, num_hidden_layers=2,
+                                       num_attention_heads=4, num_key_value_heads=4, num_experts=8,
+                                       num_experts_per_tok=2, max_position_embeddings=512, eos_token_id=None)
+        transformers.OlmoeForCausalLM(cfg).save_pretrained(tmp_path / name)
+        dirs.append(str(tmp_path / name))
+    script = Path(__file__).resolve().parents[1] / "experiments" / "e7_real_checkpoints.py"
+    out = tmp_path / "e7.json"
+    run = lambda: subprocess.run([sys.executable, str(script), "--local_dirs", *dirs, "--tokenizer", "bytes",  # noqa: E731
+                                  "--device", "cpu", "--dtype", "float32", "--n_chunks", "2", "--out", str(out)],
+                                 capture_output=True, text=True, check=True).stdout
+    run()
+    first = out.read_text()
+    for ext in ("json", "npz"):  # pretend the run died before the second checkpoint finished
+        (tmp_path / "e7" / f"step900-tok9B.{ext}").unlink()
+    log = run()
+    assert "cached step100-tok1B" in log and "loading step900-tok9B" in log
+    assert out.read_text() == first
